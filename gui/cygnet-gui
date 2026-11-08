@@ -1,0 +1,752 @@
+#!/usr/bin/env python3
+"""Cygnet: a small GTK window for the cygnet command.
+
+The window never handles the tunnel itself. It reads the connection files, which are
+readable by everyone apart from the pre-shared keys, and runs `cygnet` through pkexec for
+everything else. `cygnet connect --ui` reports progress as one event per line on stdout
+and reads the password and code from stdin; closing stdin cancels it.
+
+Closing the window keeps the app running in the background, so it can tell you when the
+code is needed or the VPN drops. Opening Cygnet again brings the window back. Quit in the
+menu exits, which never disconnects.
+"""
+
+import os
+import re
+import subprocess
+import sys
+import time
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+
+APP_ID = "io.github.Khalid_AlHajri.Cygnet"
+VERSION = "1.0"
+WEBSITE = "https://github.com/Khalid-AlHajri/cygnet"
+
+# These can be overridden to try the window out against tests/fake-cygnet.
+FAKE_CLI = os.environ.get("CYGNET_CLI")
+COMMAND = [FAKE_CLI] if FAKE_CLI else ["pkexec", "/usr/local/bin/cygnet"]
+CONN_DIR = os.environ.get("CYGNET_CONN_DIR", "/opt/cygnet/etc/connections")
+ACTIVE = os.environ.get("CYGNET_ACTIVE", "/run/cygnet.active")
+
+DEFAULT_IKE = "aes256-sha256-modp2048"
+DEFAULT_ESP = "aes256-sha256"
+POLL_SECONDS = 3
+PKEXEC_REFUSED = (126, 127)  # the admin password prompt was dismissed or failed
+
+# The same rules as the checks in cygnet, which has the final say.
+NAME_RE = re.compile(r"[^\x00-\x1f\x7f]{1,64}")
+GATEWAY_RE = re.compile(r"[A-Za-z0-9.:-]{1,253}")
+USERNAME_RE = re.compile(r"[^\x00-\x20\x7f]{1,128}")
+NETWORK_RE = re.compile(r"(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?:/(\d{1,2}))?")
+PROPOSALS_RE = re.compile(r"[a-z0-9_-]+(,[a-z0-9_-]+)*")
+PSK_RE = re.compile(r"[^\x00-\x1f\x7f]{1,1024}")
+CODE_RE = re.compile(r"\d{4,10}")
+
+
+def valid_networks(text):
+    nets = [n for n in re.sub(r"\s", "", text).split(",") if n]
+    for net in nets:
+        m = NETWORK_RE.fullmatch(net)
+        if not m or any(int(x) > 255 for x in m.groups()[:4]) or int(m.group(5) or 0) > 32:
+            return False
+    return bool(nets)
+
+
+def read_connections():
+    """The connections in CONN_DIR, sorted by name, as dicts of their settings."""
+    try:
+        files = os.listdir(CONN_DIR)
+    except OSError:
+        return []
+    conns = []
+    for filename in files:
+        if not filename.endswith(".conf") or filename.startswith("."):
+            continue
+        conn = {"id": filename[: -len(".conf")]}
+        try:
+            with open(os.path.join(CONN_DIR, filename), encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    key, sep, value = line.partition("=")
+                    if sep and not key.lstrip().startswith("#"):
+                        conn[key.strip()] = value.strip()
+        except OSError:
+            continue
+        conn.setdefault("name", conn["id"])
+        conns.append(conn)
+    return sorted(conns, key=lambda c: c["name"].lower())
+
+
+def read_tunnel():
+    """(id of the connected connection, its address, connected-since time), or Nones.
+
+    The active file says which connection was brought up. Whether it is still up comes from
+    the routes charon keeps in table 220, which anyone can read.
+    """
+    try:
+        with open(ACTIVE) as f:
+            conn_id = f.read().strip()
+        since = os.stat(ACTIVE).st_mtime
+    except OSError:
+        return None, None, None
+    if FAKE_CLI:
+        return conn_id, "10.212.0.5", since
+    try:
+        routes = subprocess.run(
+            ["ip", "-4", "route", "show", "table", "220"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None, None, None
+    if not routes.strip():
+        return None, None, None
+    m = re.search(r"\bsrc (\S+)", routes)
+    return conn_id, m.group(1) if m else None, since
+
+
+def run_cli(args, stdin_text, callback):
+    """Runs cygnet ARGS, then calls callback(ok, events) with its output lines."""
+    proc = Gio.Subprocess.new(
+        COMMAND + args + ["--ui"],
+        Gio.SubprocessFlags.STDIN_PIPE
+        | Gio.SubprocessFlags.STDOUT_PIPE
+        | Gio.SubprocessFlags.STDERR_MERGE,
+    )
+
+    def done(proc, result):
+        try:
+            _, out, _ = proc.communicate_utf8_finish(result)
+        except GLib.Error as e:
+            callback(False, [f"error {e.message}"])
+            return
+        lines = (out or "").splitlines()
+        status = proc.get_exit_status() if proc.get_if_exited() else -1
+        if status in PKEXEC_REFUSED and not lines:
+            lines = ["error You weren't allowed to manage the VPN."]
+        callback(status == 0, lines)
+
+    proc.communicate_utf8_async(stdin_text, None, done)
+
+
+def errors_in(lines):
+    msgs = [line[len("error ") :] for line in lines if line.startswith("error ")]
+    return "\n".join(msgs) or "\n".join(lines) or "Something went wrong."
+
+
+class Session:
+    """A running `cygnet connect --ui`."""
+
+    def __init__(self, conn_id, on_event, on_exit):
+        self.on_event = on_event
+        self.on_exit = on_exit
+        self.proc = Gio.Subprocess.new(
+            COMMAND + ["connect", conn_id, "--ui"],
+            Gio.SubprocessFlags.STDIN_PIPE
+            | Gio.SubprocessFlags.STDOUT_PIPE
+            | Gio.SubprocessFlags.STDERR_MERGE,
+        )
+        self.stdin = self.proc.get_stdin_pipe()
+        self.out = Gio.DataInputStream.new(self.proc.get_stdout_pipe())
+        self.out.read_line_async(GLib.PRIORITY_DEFAULT, None, self._on_line)
+
+    def _on_line(self, stream, result):
+        try:
+            line, _ = stream.read_line_finish_utf8(result)
+        except GLib.Error:
+            line = None
+        if line is None:
+            self.proc.wait_async(None, self._on_done)
+            return
+        event, _, arg = line.partition(" ")
+        self.on_event(event, arg)
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._on_line)
+
+    def _on_done(self, proc, result):
+        try:
+            proc.wait_finish(result)
+        except GLib.Error:
+            pass
+        status = proc.get_exit_status() if proc.get_if_exited() else -1
+        self.on_exit(status)
+
+    def send(self, text):
+        try:
+            self.stdin.write_all((text + "\n").encode(), None)
+        except GLib.Error:
+            pass  # it has already exited, and _on_done will say why
+
+    def cancel(self):
+        try:
+            self.stdin.close(None)
+        except GLib.Error:
+            pass
+
+
+def status_page(icon, title, description=""):
+    page = Adw.StatusPage(icon_name=icon, title=title)
+    page.set_description(GLib.markup_escape_text(description))
+    return page
+
+
+def pill(label, style=None):
+    button = Gtk.Button(label=label, halign=Gtk.Align.CENTER)
+    button.add_css_class("pill")
+    if style:
+        button.add_css_class(style)
+    return button
+
+
+def column(*children):
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+    for child in children:
+        box.append(child)
+    return box
+
+
+class ConnectionPage(Adw.NavigationPage):
+    """Connecting to, and showing, one connection."""
+
+    def __init__(self, window, conn):
+        super().__init__(title=conn["name"])
+        self.window = window
+        self.conn = conn
+        self.session = None
+        self.password = None
+        self.cancelled = False
+        self.errors = []
+        self.log = []
+
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        view = Adw.ToolbarView(content=self.stack)
+        view.add_top_bar(Adw.HeaderBar())
+        self.set_child(view)
+
+        # Signing in
+        self.password_row = Adw.PasswordEntryRow(title="Password")
+        self.password_row.connect("entry-activated", lambda _: self.start())
+        group = Adw.PreferencesGroup()
+        group.add(self.password_row)
+        self.blocked = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, visible=False)
+        self.blocked.add_css_class("dim-label")
+        self.connect_button = pill("Connect", "suggested-action")
+        self.connect_button.connect("clicked", lambda _: self.start())
+        self.sign_in = status_page("network-vpn-symbolic", conn["name"])
+        self.sign_in.set_child(column(group, self.blocked, self.connect_button))
+        self.stack.add_named(self.sign_in, "password")
+
+        # Waiting on the gateway
+        spinner = Gtk.Spinner(spinning=True, width_request=32, height_request=32)
+        cancel = pill("Cancel")
+        cancel.connect("clicked", lambda _: self.cancel())
+        self.busy = status_page(None, "Signing In…")
+        self.busy.set_child(column(spinner, cancel))
+        self.stack.add_named(self.busy, "busy")
+
+        # The code
+        self.code_row = Adw.EntryRow(title="Code", input_purpose=Gtk.InputPurpose.DIGITS)
+        self.code_row.connect("entry-activated", lambda _: self.send_code())
+        self.code_row.connect("changed", lambda _: self.code_row.remove_css_class("error"))
+        group = Adw.PreferencesGroup()
+        group.add(self.code_row)
+        check = pill("Check Code", "suggested-action")
+        check.connect("clicked", lambda _: self.send_code())
+        cancel = Gtk.Button(label="Cancel", halign=Gtk.Align.CENTER)
+        cancel.add_css_class("flat")
+        cancel.connect("clicked", lambda _: self.cancel())
+        self.code_page = status_page("mail-unread-symbolic", "Enter Your Code")
+        self.code_page.set_child(column(group, check, cancel))
+        self.stack.add_named(self.code_page, "code")
+
+        # Connected
+        self.address_row = self._info_row("Address")
+        self.networks_row = self._info_row("Networks")
+        self.since_row = self._info_row("Connected Since")
+        group = Adw.PreferencesGroup()
+        for row in (self.address_row, self.networks_row, self.since_row):
+            group.add(row)
+        disconnect = pill("Disconnect", "destructive-action")
+        disconnect.connect("clicked", lambda _: self.window.disconnect_vpn())
+        self.connected_page = status_page("network-vpn-symbolic", "Connected")
+        self.connected_page.set_child(column(group, disconnect))
+        self.stack.add_named(self.connected_page, "connected")
+
+        # Failed
+        self.details = Gtk.Label(wrap=True, selectable=True, xalign=0)
+        self.details.add_css_class("monospace")
+        expander = Gtk.Expander(label="Details", child=self.details)
+        again = pill("Try Again", "suggested-action")
+        again.connect("clicked", lambda _: self.show("password"))
+        self.failed = status_page("dialog-warning-symbolic", "Couldn’t Connect")
+        self.failed.set_child(column(expander, again))
+        self.stack.add_named(self.failed, "failed")
+
+        self.refresh()
+
+    @staticmethod
+    def _info_row(title):
+        row = Adw.ActionRow(title=title)
+        label = Gtk.Label(selectable=True, wrap=True, xalign=1)
+        label.add_css_class("dim-label")
+        row.add_suffix(label)
+        row.value = label
+        return row
+
+    @property
+    def busy_now(self):
+        return self.session is not None
+
+    def show(self, name, title=None):
+        if name == "busy":
+            self.busy.set_title(title)
+        self.stack.set_visible_child_name(name)
+        self.set_can_pop(name not in ("busy", "code"))
+        if name == "password":
+            self.password_row.grab_focus()
+        elif name == "code":
+            self.code_row.grab_focus()
+
+    def set_conn(self, conn):
+        self.conn = conn
+        self.set_title(conn["name"])
+        self.sign_in.set_title(conn["name"])
+        self.sign_in.set_description(
+            GLib.markup_escape_text(f"{conn.get('username', '')} at {conn.get('gateway', '')}")
+        )
+
+    def refresh(self):
+        """Matches the page to the tunnel's state, unless an attempt is in progress."""
+        self.set_conn(self.conn)
+        if self.busy_now:
+            return
+        w = self.window
+        if w.active_id == self.conn["id"]:
+            self.address_row.value.set_label(w.address or "—")
+            self.networks_row.value.set_label(self.conn.get("networks", ""))
+            self.since_row.value.set_label(time.strftime("%H:%M, %d %b", time.localtime(w.since)))
+            self.connected_page.set_description(GLib.markup_escape_text(self.conn["name"]))
+            self.show("connected")
+            return
+        if self.stack.get_visible_child_name() in ("connected", "busy", "code"):
+            self.show("password")
+        elif self.stack.get_visible_child_name() == "password":
+            self.set_can_pop(True)
+        other = w.active_id or w.connecting_id()
+        blocked = other is not None and other != self.conn["id"]
+        if blocked:
+            self.blocked.set_label(f"Disconnect from {w.conn_name(other)} first.")
+        self.blocked.set_visible(blocked)
+        self.connect_button.set_sensitive(not blocked)
+
+    def start(self):
+        if self.busy_now or not self.connect_button.get_sensitive():
+            return
+        password = self.password_row.get_text()
+        if not password:
+            self.password_row.add_css_class("error")
+            return
+        self.password_row.remove_css_class("error")
+        self.password_row.set_text("")
+        self.password = password
+        self.cancelled = False
+        self.errors, self.log = [], []
+        self.session = Session(self.conn["id"], self.on_event, self.on_exit)
+        self.show("busy", "Signing In…")
+        self.window.refresh()
+
+    def cancel(self):
+        if self.session:
+            self.cancelled = True
+            self.session.cancel()
+            self.show("busy", "Cancelling…")
+
+    def send_code(self):
+        code = re.sub(r"\s", "", self.code_row.get_text())
+        if not CODE_RE.fullmatch(code):
+            self.code_row.add_css_class("error")
+            return
+        self.code_row.set_text("")
+        self.window.app.withdraw_notification("code")
+        self.session.send(code)
+        self.show("busy", "Checking the Code…")
+
+    def on_event(self, event, arg):
+        if event == "need-password" and self.password is not None:
+            self.session.send(self.password)
+            self.password = None
+        elif event == "connecting":
+            self.show("busy", "Signing In…")
+        elif event == "need-code":
+            retry = arg not in ("", "0")
+            self.code_page.set_description(
+                "The gateway asked again, so the last code was probably wrong. Enter the new one."
+                if retry
+                else "Password accepted. The gateway is sending your code now, and only waits a short time for it."
+            )
+            self.show("code")
+            self.window.notify_unless_focused(
+                "code", "Enter your VPN code", f"{self.conn['name']} is waiting for your one-time code.",
+                urgent=True,
+            )
+        elif event == "checking":
+            self.show("busy", "Checking the Code…")
+        elif event == "error":
+            self.errors.append(arg)
+        elif event == "log":
+            self.log.append(arg)
+        elif event != "connected":
+            self.log.append(f"{event} {arg}".strip())
+
+    def on_exit(self, status):
+        self.session = None
+        self.password = None
+        self.window.app.withdraw_notification("code")
+        if status == 0:
+            self.window.poll()
+            self.window.notify_unless_focused("state", "VPN connected", f"Connected to {self.conn['name']}.")
+        elif self.cancelled or status == 130:
+            self.show("password")
+        else:
+            if status in PKEXEC_REFUSED and not self.errors:
+                self.errors = ["You weren't allowed to manage the VPN."]
+            message = "\n".join(self.errors) or "The connection attempt ended unexpectedly."
+            self.failed.set_description(GLib.markup_escape_text(message))
+            self.details.set_label("\n".join(self.log) or "No log.")
+            self.show("failed")
+            self.window.notify_unless_focused("state", "VPN didn't connect", self.errors[0] if self.errors else message)
+        self.window.refresh()
+
+
+class ConnectionDialog(Adw.Dialog):
+    """Adding or changing a connection."""
+
+    def __init__(self, window, conn=None):
+        super().__init__(title="Edit Connection" if conn else "Add Connection", content_width=460)
+        self.window = window
+        self.conn = conn
+        conn = conn or {}
+
+        cancel = Gtk.Button(label="Cancel")
+        cancel.connect("clicked", lambda _: self.close())
+        self.save_button = Gtk.Button(label="Save" if self.conn else "Add")
+        self.save_button.add_css_class("suggested-action")
+        self.save_button.connect("clicked", lambda _: self.save())
+        header = Adw.HeaderBar(show_start_title_buttons=False, show_end_title_buttons=False)
+        header.pack_start(cancel)
+        header.pack_end(self.save_button)
+
+        page = Adw.PreferencesPage()
+        self.rows = {}
+        group = Adw.PreferencesGroup()
+        if self.conn:
+            group.set_description("Leave the pre-shared key empty to keep the current one.")
+        self._entry(group, "name", "Name", conn.get("name", ""), NAME_RE.fullmatch)
+        self._entry(group, "gateway", "Gateway Address", conn.get("gateway", ""), GATEWAY_RE.fullmatch)
+        self._entry(group, "username", "Username", conn.get("username", ""), USERNAME_RE.fullmatch)
+        self._entry(
+            group, "psk", "Pre-Shared Key", "",
+            (lambda v: not v or PSK_RE.fullmatch(v)) if self.conn else PSK_RE.fullmatch,
+            password=True,
+        )
+        page.add(group)
+
+        group = Adw.PreferencesGroup(
+            title="Tunneled Networks",
+            description="Only these go through the VPN. Separate them with commas, "
+            "e.g. 10.1.0.0/16, 10.2.3.4/32. Use 0.0.0.0/0 to send all IPv4 traffic through it.",
+        )
+        self._entry(group, "networks", "Networks", conn.get("networks", ""), valid_networks)
+        page.add(group)
+
+        group = Adw.PreferencesGroup()
+        expander = Adw.ExpanderRow(title="Encryption", subtitle="Must match what the gateway accepts")
+        group.add(expander)
+        check = lambda v: PROPOSALS_RE.fullmatch(re.sub(r"\s", "", v))  # noqa: E731
+        self._entry(expander, "ike_proposals", "IKE Proposals", conn.get("ike_proposals", DEFAULT_IKE), check)
+        self._entry(expander, "esp_proposals", "ESP Proposals", conn.get("esp_proposals", DEFAULT_ESP), check)
+        page.add(group)
+
+        if self.conn:
+            delete = pill("Delete Connection", "destructive-action")
+            delete.connect("clicked", lambda _: self.confirm_delete())
+            group = Adw.PreferencesGroup()
+            group.add(delete)
+            page.add(group)
+
+        view = Adw.ToolbarView(content=page)
+        view.add_top_bar(header)
+        self.set_child(view)
+        self.validate()
+
+    def _entry(self, parent, key, title, value, check, password=False):
+        row = (Adw.PasswordEntryRow if password else Adw.EntryRow)(title=title, text=value)
+        row.check = check
+        row.touched = False
+
+        def changed(row):
+            row.touched = True
+            self.validate()
+
+        row.connect("changed", changed)
+        row.connect("entry-activated", lambda _: self.save())
+        (parent.add_row if isinstance(parent, Adw.ExpanderRow) else parent.add)(row)
+        self.rows[key] = row
+
+    def validate(self):
+        ok = True
+        for row in self.rows.values():
+            valid = bool(row.check(row.get_text().strip()))
+            ok = ok and valid
+            if valid or not row.touched:
+                row.remove_css_class("error")
+            else:
+                row.add_css_class("error")
+        self.save_button.set_sensitive(ok)
+        return ok
+
+    def save(self):
+        if not self.validate():
+            return
+        lines = [f"{key}={row.get_text().strip()}" for key, row in self.rows.items() if key != "psk"]
+        psk = self.rows["psk"].get_text()
+        if psk:
+            lines.append(f"psk={psk}")
+        self.save_button.set_sensitive(False)
+        args = ["save", self.conn["id"]] if self.conn else ["save"]
+        run_cli(args, "\n".join(lines) + "\n", self.saved)
+
+    def saved(self, ok, lines):
+        self.save_button.set_sensitive(True)
+        if ok:
+            self.window.reload()
+            self.close()
+        else:
+            self.window.alert("Couldn’t Save the Connection", errors_in(lines), parent=self)
+
+    def confirm_delete(self):
+        dialog = Adw.AlertDialog(
+            heading=f"Delete {self.conn['name']}?",
+            body="Its settings and pre-shared key are removed from this computer.",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("delete", "Delete")
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.connect("response", lambda _, r: r == "delete" and run_cli(["remove", self.conn["id"]], "", self.deleted))
+        dialog.present(self)
+
+    def deleted(self, ok, lines):
+        if ok:
+            self.window.reload()
+            self.window.nav.pop_to_tag("list")
+            self.close()
+        else:
+            self.window.alert("Couldn’t Delete the Connection", errors_in(lines), parent=self)
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Cygnet", default_width=440, default_height=620)
+        self.app = app
+        self.set_hide_on_close(True)  # closing sends Cygnet to the background
+        self.conns = []
+        self.pages = {}
+        self.active_id = self.address = self.since = None
+        self.was_up = None
+        self.disconnecting = False
+
+        add = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="Add Connection")
+        add.connect("clicked", lambda _: self.edit())
+        menu = Gio.Menu()
+        menu.append("About Cygnet", "app.about")
+        menu.append("Quit", "app.quit")
+        header = Adw.HeaderBar()
+        header.pack_start(add)
+        header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu, tooltip_text="Main Menu"))
+
+        self.list_stack = Gtk.Stack()
+        empty_add = pill("Add Connection", "suggested-action")
+        empty_add.connect("clicked", lambda _: self.edit())
+        empty = status_page(
+            "network-vpn-symbolic", "No Connections",
+            "Add your VPN’s gateway address, username and pre-shared key to get started.",
+        )
+        empty.set_child(empty_add)
+        self.list_stack.add_named(empty, "empty")
+        self.group = Adw.PreferencesGroup()
+        prefs = Adw.PreferencesPage()
+        prefs.add(self.group)
+        self.list_stack.add_named(prefs, "list")
+        self.rows = []
+
+        view = Adw.ToolbarView(content=self.list_stack)
+        view.add_top_bar(header)
+        self.nav = Adw.NavigationView()
+        self.nav.add(Adw.NavigationPage(title="Cygnet", tag="list", child=view))
+        self.set_content(self.nav)
+
+        self.monitor = Gio.File.new_for_path(CONN_DIR).monitor_directory(Gio.FileMonitorFlags.NONE, None)
+        self.monitor.connect("changed", lambda *_: self.reload())
+        self.reload()
+        self.poll()
+        GLib.timeout_add_seconds(POLL_SECONDS, lambda: self.poll() or True)
+
+    # State
+
+    def conn_name(self, conn_id):
+        for conn in self.conns:
+            if conn["id"] == conn_id:
+                return conn["name"]
+        return conn_id
+
+    def connecting_id(self):
+        for conn_id, page in self.pages.items():
+            if page.busy_now:
+                return conn_id
+        return None
+
+    def reload(self):
+        self.conns = read_connections()
+        by_id = {c["id"]: c for c in self.conns}
+        for conn_id, page in list(self.pages.items()):
+            if conn_id in by_id:
+                page.set_conn(by_id[conn_id])
+            elif not page.busy_now:
+                del self.pages[conn_id]
+        self.refresh()
+
+    def poll(self):
+        active, address, since = read_tunnel()
+        up = active is not None
+        if self.was_up and not up and not self.disconnecting and self.connecting_id() is None:
+            name = self.conn_name(self.active_id)
+            self.notify("state", "VPN disconnected", f"{name} is no longer connected. Reconnecting needs a new code.")
+        changed = (active, address, since) != (self.active_id, self.address, self.since)
+        self.active_id, self.address, self.since = active, address, since
+        self.was_up = up
+        if changed:
+            self.refresh()
+
+    def refresh(self):
+        for row in self.rows:
+            self.group.remove(row)
+        self.rows = []
+        connecting = self.connecting_id()
+        for conn in self.conns:
+            row = Adw.ActionRow(title=conn["name"], activatable=True, use_markup=False)
+            row.set_subtitle(f"{conn.get('username', '')} at {conn.get('gateway', '')}")
+            row.set_subtitle_lines(1)
+            # Only network-vpn-symbolic is in every icon theme, so the state is shown with color.
+            icon = Gtk.Image(icon_name="network-vpn-symbolic")
+            if conn["id"] == self.active_id:
+                icon.add_css_class("success")
+                row.set_subtitle("Connected")
+            elif conn["id"] == connecting:
+                icon.add_css_class("accent")
+                row.set_subtitle("Connecting…")
+            else:
+                icon.add_css_class("dim-label")
+            row.add_prefix(icon)
+            edit = Gtk.Button(icon_name="document-edit-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Edit")
+            edit.add_css_class("flat")
+            edit.connect("clicked", lambda _, c=conn: self.edit(c))
+            row.add_suffix(edit)
+            row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+            row.connect("activated", lambda _, c=conn: self.open(c))
+            self.group.add(row)
+            self.rows.append(row)
+        self.list_stack.set_visible_child_name("list" if self.conns else "empty")
+        for page in self.pages.values():
+            page.refresh()
+
+    # Actions
+
+    def open(self, conn):
+        page = self.pages.get(conn["id"])
+        if page is None:
+            page = self.pages[conn["id"]] = ConnectionPage(self, conn)
+        if self.nav.get_visible_page() is not page:
+            self.nav.pop_to_tag("list")
+            self.nav.push(page)
+        page.refresh()
+
+    def edit(self, conn=None):
+        ConnectionDialog(self, conn).present(self)
+
+    def disconnect_vpn(self):
+        self.disconnecting = True
+
+        def done(ok, lines):
+            self.poll()
+            self.disconnecting = False
+            if not ok:
+                self.alert("Couldn’t Disconnect", errors_in(lines))
+
+        run_cli(["disconnect"], "", done)
+
+    # Feedback
+
+    def alert(self, heading, body, parent=None):
+        dialog = Adw.AlertDialog(heading=heading, body=body)
+        dialog.add_response("ok", "OK")
+        dialog.present(parent or self)
+
+    def notify(self, key, title, body, urgent=False):
+        notification = Gio.Notification.new(title)
+        notification.set_body(body)
+        notification.set_default_action("app.show")
+        if urgent:
+            notification.set_priority(Gio.NotificationPriority.URGENT)
+        self.app.send_notification(key, notification)
+
+    def notify_unless_focused(self, key, title, body, urgent=False):
+        if not (self.get_visible() and self.is_active()):
+            self.notify(key, title, body, urgent)
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        self.window = None
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        GLib.set_application_name("Cygnet")
+        self.hold()  # keep running when the window is closed
+        for name, callback in (("show", self.on_show), ("about", self.on_about), ("quit", self.on_quit)):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", callback)
+            self.add_action(action)
+        self.set_accels_for_action("app.quit", ["<Control>q"])
+        self.set_accels_for_action("window.close", ["<Control>w"])
+
+    def do_activate(self):
+        if self.window is None:
+            self.window = Window(self)
+        self.window.present()
+
+    def on_show(self, *_):
+        self.activate()
+
+    def on_about(self, *_):
+        Adw.AboutDialog(
+            application_name="Cygnet",
+            application_icon=APP_ID,
+            developer_name="Khalid Al Hajri",
+            version=VERSION,
+            website=WEBSITE,
+            issue_url=WEBSITE + "/issues",
+            license_type=Gtk.License.GPL_2_0,
+            comments="Connect to FortiGate VPNs that ask for a one-time code.\n\n"
+            "An unofficial community tool, not affiliated with Fortinet.",
+        ).present(self.window)
+
+    def on_quit(self, *_):
+        # Cancels any attempt in progress, as its stdin closes. A tunnel that is up stays up.
+        self.quit()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

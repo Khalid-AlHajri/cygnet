@@ -1,0 +1,704 @@
+#!/usr/bin/env bash
+# cygnet: connect to FortiGate IPsec VPNs that ask for a one-time code.
+#
+#   cygnet [connect] [NAME]   prompt for the password, then for the code once it is sent
+#   cygnet disconnect         take the tunnel down
+#   cygnet status             show the tunnel state
+#   cygnet list               list your connections
+#   cygnet add                add a connection
+#   cygnet edit NAME          change a connection
+#   cygnet remove NAME        delete a connection
+#
+# NAME is a connection's name or id. It can be left out when there's only one connection.
+# One connection can be up at a time.
+#
+# Each connection is two files in $CONN_DIR: <id>.conf holds the settings and is readable
+# by everyone so the GUI can list it, and <id>.psk holds the pre-shared key and is readable
+# only by root. Only the connection in use is loaded into charon, as $SWAN_CONF.
+#
+# The gateway only sends the code after accepting the password, inside one IKE exchange.
+# charon runs otp-helper at that point, which blocks on a FIFO that this script feeds.
+# Neither the password nor the code is written to disk or passed on a command line.
+#
+# With --ui, this talks to the Cygnet GUI instead of a terminal: it prints one event per
+# line on stdout and reads the password and code as lines on stdin. Closing stdin cancels.
+set -eu
+umask 077
+
+PREFIX=/opt/cygnet
+SWANCTL=$PREFIX/sbin/swanctl
+CONN_DIR=$PREFIX/etc/connections
+SERVICE=cygnet.service
+CONN=fortigate # swanctl's name for whichever connection is in use
+
+RUN_DIR=/run/cygnet # root-only tmpfs, created by the service
+SWAN_CONF=$RUN_DIR/swanctl.conf
+FIFO=$RUN_DIR/otp.fifo
+REQUEST=$RUN_DIR/otp.request
+LOG=$RUN_DIR/initiate.log
+ACTIVE=/run/cygnet.active # id of the connected connection, readable by the GUI
+
+DEFAULT_IKE_PROPOSALS=aes256-sha256-modp2048
+DEFAULT_ESP_PROPOSALS=aes256-sha256
+
+# Longer than the helper's own wait, so the helper always gives up first.
+INITIATE_TIMEOUT=300
+CODE_PROMPT_TIMEOUT=240
+
+ui=
+creds=
+init_pid=
+fifo_open=
+connected=
+
+# --- Output ------------------------------------------------------------------------------
+
+event() { if [[ -n $ui ]]; then printf '%s\n' "$*"; fi; }
+say() { if [[ -z $ui ]]; then printf '%s\n' "$*"; fi; }
+
+die() {
+    if [[ -n $ui ]]; then
+        printf '%s\n' "$*" | sed 's/^/error /'
+    else
+        echo "cygnet: $*" >&2
+    fi
+    exit 1
+}
+
+# --- Connections -------------------------------------------------------------------------
+
+trim() {
+    local v=$1
+    v=${v#"${v%%[![:space:]]*}"}
+    printf %s "${v%"${v##*[![:space:]]}"}"
+}
+
+# The value of KEY in a connection file. Files are parsed, never sourced.
+conf_get() {
+    local file=$1 key=$2 line
+    while IFS= read -r line; do
+        if [[ $line =~ ^[[:space:]]*$key[[:space:]]*=(.*)$ ]]; then
+            trim "${BASH_REMATCH[1]}"
+            return
+        fi
+    done <"$file"
+}
+
+conn_ids() {
+    local f
+    for f in "$CONN_DIR"/*.conf; do
+        [[ -e $f ]] || continue
+        f=${f##*/}
+        echo "${f%.conf}"
+    done
+}
+
+# Sets c_name, c_gateway, c_username, c_networks, c_ike and c_esp from connection $1.
+load_conn() {
+    local f=$CONN_DIR/$1.conf
+    [[ -r $f ]] || die "no connection with id $1"
+    c_name=$(conf_get "$f" name)
+    c_gateway=$(conf_get "$f" gateway)
+    c_username=$(conf_get "$f" username)
+    c_networks=$(conf_get "$f" networks)
+    c_ike=$(conf_get "$f" ike_proposals)
+    c_esp=$(conf_get "$f" esp_proposals)
+    c_ike=${c_ike:-$DEFAULT_IKE_PROPOSALS}
+    c_esp=${c_esp:-$DEFAULT_ESP_PROPOSALS}
+}
+
+# Sets id to the connection called $1 (a name or an id), or to the only one if $1 is empty.
+pick() {
+    local want=$1 ids n i
+    mapfile -t ids < <(conn_ids)
+    if [[ -n $want ]]; then
+        for id in "${ids[@]}"; do
+            [[ $id != "$want" ]] || return 0
+        done
+        for id in "${ids[@]}"; do
+            n=$(conf_get "$CONN_DIR/$id.conf" name)
+            [[ ${n,,} != "${want,,}" ]] || return 0
+        done
+        die "there's no connection called $want (see: cygnet list)"
+    fi
+    case ${#ids[@]} in
+    0) die "there are no connections yet; add one with: cygnet add" ;;
+    1) id=${ids[0]} ;;
+    *)
+        [[ -z $ui ]] || die "there are several connections, so name one"
+        for i in "${!ids[@]}"; do
+            printf '%d) %s\n' $((i + 1)) "$(conf_get "$CONN_DIR/${ids[i]}.conf" name)"
+        done
+        while :; do
+            read -rp "Which one? " n
+            if [[ $n =~ ^[0-9]+$ ]] && ((n >= 1 && n <= ${#ids[@]})); then
+                id=${ids[n - 1]}
+                return
+            fi
+        done
+        ;;
+    esac
+}
+
+new_id() {
+    local base n=2
+    base=$(printf %s "${1,,}" | tr -cs 'a-z0-9' - | sed 's/^-*//; s/-*$//' | cut -c1-32)
+    base=${base:-vpn}
+    id=$base
+    while [[ -e $CONN_DIR/$id.conf ]]; do
+        id=$base-$n
+        n=$((n + 1))
+    done
+}
+
+# Validators: each prints the cleaned-up value, or explains the problem on stderr.
+check_name() {
+    [[ -n $1 && ${#1} -le 256 && $1 =~ ^[^[:cntrl:]]+$ ]] && printf %s "$1" && return
+    echo "Give the connection a name." >&2
+    return 1
+}
+check_gateway() {
+    [[ $1 =~ ^[A-Za-z0-9.:-]{1,253}$ ]] && printf %s "$1" && return
+    echo "The gateway is an IP address or hostname, such as vpn.example.com." >&2
+    return 1
+}
+check_username() {
+    [[ ${#1} -le 256 && $1 =~ ^[^[:cntrl:][:space:]]+$ ]] && printf %s "$1" && return
+    echo "The username can't be empty or contain spaces." >&2
+    return 1
+}
+check_networks() {
+    local v=${1//[[:space:]]/} net out= i
+    local -a nets
+    IFS=, read -ra nets <<<"$v"
+    for net in "${nets[@]}"; do
+        [[ -n $net ]] || continue
+        if [[ $net =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(/([0-9]{1,2}))?$ ]]; then
+            for i in 1 2 3 4; do
+                ((10#${BASH_REMATCH[i]} <= 255)) || net=
+            done
+            [[ -z ${BASH_REMATCH[6]} ]] || ((10#${BASH_REMATCH[6]} <= 32)) || net=
+        else
+            net=
+        fi
+        if [[ -z $net ]]; then
+            echo "List networks like 10.1.0.0/16, 10.2.3.4/32, separated by commas." >&2
+            return 1
+        fi
+        out+=${out:+, }$net
+    done
+    [[ -n $out ]] && printf %s "$out" && return
+    echo "List at least one network, such as 10.1.0.0/16. Use 0.0.0.0/0 for everything." >&2
+    return 1
+}
+check_proposals() {
+    local v=${1//[[:space:]]/}
+    [[ $v =~ ^[a-z0-9_-]+(,[a-z0-9_-]+)*$ ]] && printf %s "$v" && return
+    echo "Proposals look like aes256-sha256-modp2048, separated by commas." >&2
+    return 1
+}
+check_psk() {
+    [[ -n $1 && ${#1} -le 1024 && $1 =~ ^[^[:cntrl:]]+$ ]] && printf %s "$1" && return
+    echo "Enter the gateway's pre-shared key." >&2
+    return 1
+}
+
+# Writes connection $id from the c_ values. c_psk may be empty to keep the current key.
+write_conn() {
+    local tmp other
+    while read -r other; do
+        if [[ $other != "$id" && $(conf_get "$CONN_DIR/$other.conf" name | tr '[:upper:]' '[:lower:]') == $(printf %s "$c_name" | tr '[:upper:]' '[:lower:]') ]]; then
+            die "there's already a connection called $c_name"
+        fi
+    done < <(conn_ids)
+    install -d -m 755 "$CONN_DIR"
+    if [[ -n $c_psk ]]; then
+        tmp=$(mktemp -p "$CONN_DIR" .new.XXXXXX)
+        printf %s "$c_psk" >"$tmp"
+        mv "$tmp" "$CONN_DIR/$id.psk"
+    fi
+    [[ -e $CONN_DIR/$id.psk ]] || die "a pre-shared key is needed"
+    tmp=$(mktemp -p "$CONN_DIR" .new.XXXXXX)
+    cat >"$tmp" <<EOF
+# Cygnet connection. Change it with the Cygnet app or: cygnet edit $id
+# The pre-shared key is in $id.psk.
+name = $c_name
+gateway = $c_gateway
+username = $c_username
+networks = $c_networks
+ike_proposals = $c_ike
+esp_proposals = $c_esp
+EOF
+    chmod 644 "$tmp"
+    mv "$tmp" "$CONN_DIR/$id.conf"
+}
+
+# Asks for a value in the terminal until VALIDATOR accepts it. An empty answer keeps DEFAULT.
+ask() {
+    local var=$1 prompt=$2 default=$3 check=$4 v
+    while :; do
+        read -rp "$prompt${default:+ [$default]}: " v
+        v=$(trim "$v")
+        v=${v:-$default}
+        if v=$("$check" "$v"); then
+            printf -v "$var" %s "$v"
+            return
+        fi
+    done
+}
+
+ask_psk() {
+    local keep=$1 v
+    while :; do
+        IFS= read -rsp "Pre-shared key${keep:+ (Enter keeps the current one)}: " v
+        echo
+        if [[ -z $v && -n $keep ]]; then
+            c_psk=
+            return
+        fi
+        if v=$(check_psk "$v"); then
+            c_psk=$v
+            return
+        fi
+    done
+}
+
+add() {
+    local id
+    echo "Your VPN admin can tell you these. Press Ctrl+C to cancel."
+    ask c_name "Name, such as Head Office" "" check_name
+    ask c_gateway "Gateway address" "" check_gateway
+    ask c_username "Username" "" check_username
+    ask_psk ""
+    ask c_networks "Networks to send through the VPN, or 0.0.0.0/0 for everything" "" check_networks
+    ask c_ike "IKE proposals" "$DEFAULT_IKE_PROPOSALS" check_proposals
+    ask c_esp "ESP proposals" "$DEFAULT_ESP_PROPOSALS" check_proposals
+    new_id "$c_name"
+    write_conn
+    echo "Added $c_name. Connect with: cygnet connect $id"
+}
+
+edit() {
+    local id
+    pick "$1"
+    load_conn "$id"
+    echo "Press Enter to keep a value, or Ctrl+C to cancel."
+    ask c_name "Name" "$c_name" check_name
+    ask c_gateway "Gateway address" "$c_gateway" check_gateway
+    ask c_username "Username" "$c_username" check_username
+    ask_psk keep
+    ask c_networks "Networks to send through the VPN" "$c_networks" check_networks
+    ask c_ike "IKE proposals" "$c_ike" check_proposals
+    ask c_esp "ESP proposals" "$c_esp" check_proposals
+    write_conn
+    echo "Saved. Changes apply the next time you connect."
+}
+
+# For the GUI: reads name=..., gateway=... lines on stdin and saves them as connection $1,
+# or as a new connection if $1 is empty. psk may be left out to keep the current key.
+save() {
+    local id=$1 line key value
+    c_name= c_gateway= c_username= c_networks= c_psk=
+    c_ike=$DEFAULT_IKE_PROPOSALS c_esp=$DEFAULT_ESP_PROPOSALS
+    if [[ -n $id ]]; then
+        [[ $id =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "invalid connection id"
+        load_conn "$id"
+    fi
+    while IFS= read -r line; do
+        key=${line%%=*}
+        value=${line#*=}
+        case $key in
+        name) c_name=$(check_name "$(trim "$value")" 2>&1) || die "$c_name" ;;
+        gateway) c_gateway=$(check_gateway "$(trim "$value")" 2>&1) || die "$c_gateway" ;;
+        username) c_username=$(check_username "$(trim "$value")" 2>&1) || die "$c_username" ;;
+        networks) c_networks=$(check_networks "$value" 2>&1) || die "$c_networks" ;;
+        ike_proposals) c_ike=$(check_proposals "$value" 2>&1) || die "$c_ike" ;;
+        esp_proposals) c_esp=$(check_proposals "$value" 2>&1) || die "$c_esp" ;;
+        psk) [[ -z $value ]] || c_psk=$(check_psk "$value" 2>&1) || die "$c_psk" ;;
+        esac
+    done
+    [[ -n $c_name && -n $c_gateway && -n $c_username && -n $c_networks ]] ||
+        die "name, gateway, username and networks are all needed"
+    [[ -n $id ]] || new_id "$c_name"
+    write_conn
+    event "saved $id"
+    say "Saved $c_name."
+}
+
+remove() {
+    local id
+    pick "$1"
+    if [[ $(active_id) == "$id" ]] && is_up; then
+        die "that connection is in use; disconnect first"
+    fi
+    load_conn "$id"
+    rm -f "$CONN_DIR/$id.conf" "$CONN_DIR/$id.psk"
+    event removed
+    say "Removed $c_name."
+}
+
+list() {
+    local id active
+    active=$(active_id)
+    if [[ -z $(conn_ids) ]]; then
+        echo "No connections yet. Add one with: cygnet add"
+        return
+    fi
+    while read -r id; do
+        load_conn "$id"
+        printf '%s  %s\n    %s at %s, networks %s\n' \
+            "$([[ $id == "$active" ]] && echo '*' || echo ' ')" "$c_name ($id)" \
+            "$c_username" "$c_gateway" "$c_networks"
+    done < <(conn_ids)
+}
+
+# Imports the vpn.conf of an earlier version: swanctl config with one connection. Only for
+# install.sh.
+import_legacy() {
+    local file=$1 id
+    [[ -z ${PKEXEC_UID:-} ]] || die "import only works from a terminal"
+    [[ -r $file ]] || die "can't read $file"
+    c_gateway=$(conf_get "$file" remote_addrs)
+    c_username=$(conf_get "$file" eap_id)
+    c_networks=$(conf_get "$file" remote_ts)
+    c_ike=$(conf_get "$file" proposals)
+    c_esp=$(conf_get "$file" esp_proposals)
+    c_psk=$(conf_get "$file" secret)
+    c_psk=${c_psk#\"}
+    c_psk=${c_psk%\"}
+    c_gateway=$(check_gateway "$c_gateway") &&
+        c_username=$(check_username "$c_username") &&
+        c_networks=$(check_networks "$c_networks") &&
+        c_ike=$(check_proposals "${c_ike:-$DEFAULT_IKE_PROPOSALS}") &&
+        c_esp=$(check_proposals "${c_esp:-$DEFAULT_ESP_PROPOSALS}") &&
+        c_psk=$(check_psk "$c_psk") || die "couldn't import $file"
+    c_name=$c_gateway
+    new_id "$c_name"
+    write_conn
+    echo "Imported $file as the connection \"$c_name\"."
+}
+
+# --- Tunnel ------------------------------------------------------------------------------
+
+active_id() {
+    cat "$ACTIVE" 2>/dev/null || true
+}
+
+is_up() {
+    systemctl is-active --quiet "$SERVICE" || return 1
+    local sas
+    sas=$("$SWANCTL" --list-sas --ike "$CONN" 2>/dev/null) || return 1
+    [[ $sas == *ESTABLISHED* ]]
+}
+
+drop_sa() {
+    "$SWANCTL" --terminate --ike "$CONN" --force --timeout 5 >/dev/null 2>&1 || true
+}
+
+# Strings in swanctl config: backslashes and quotes are escaped.
+quote() {
+    local v=${1//\\/\\\\}
+    printf '"%s"' "${v//\"/\\\"}"
+}
+
+hex() {
+    od -An -v -tx1 | tr -d ' \n'
+}
+
+# swanctl config for the c_ connection $1, with its pre-shared key but not the password.
+write_swanctl_conf() {
+    local psk
+    psk=$(hex <"$CONN_DIR/$1.psk")
+    cat >"$SWAN_CONF" <<EOF
+connections {
+    $CONN {
+        version = 2
+        remote_addrs = $c_gateway
+        local_addrs = %any
+        vips = 0.0.0.0
+        mobike = no
+        proposals = $c_ike
+        rekey_time = 86400s
+        dpd_delay = 30s
+        local-eap {
+            auth = eap-mschapv2
+            eap_id = $(quote "$c_username")
+        }
+        remote {
+            auth = psk
+        }
+        children {
+            $CONN {
+                remote_ts = $c_networks
+                local_ts = dynamic
+                esp_proposals = $c_esp
+                rekey_time = 43200s
+                # Not restart: reconnecting needs a new code, so it has to be manual.
+                dpd_action = clear
+                start_action = none
+            }
+        }
+    }
+}
+secrets {
+    ike-$CONN {
+        secret = 0x$psk
+    }
+}
+EOF
+}
+
+# Hex-encoded so that no password character can break the config syntax. The connection's
+# config is included because loading credentials unloads any that aren't in the file, which
+# would otherwise drop the pre-shared key.
+load_password() {
+    local password=$1 output
+    creds=$(mktemp -p "$RUN_DIR" creds.XXXXXX)
+    cat >"$creds" <<EOF
+include $SWAN_CONF
+secrets {
+    eap-$CONN {
+        id = $(quote "$c_username")
+        secret = 0x$(printf %s "$password" | hex)
+    }
+}
+EOF
+    output=$("$SWANCTL" --load-creds --clear --noprompt --file "$creds" 2>&1) ||
+        die "charon refused the credentials: $output"
+    rm -f "$creds"
+}
+
+cleanup() {
+    # Release the helper if it is still waiting, or charon stays blocked on it.
+    if [[ -n $fifo_open ]]; then
+        printf '\n' >&3 || true
+    fi
+    if [[ -n $init_pid ]]; then
+        kill "$init_pid" 2>/dev/null || true
+    fi
+    rm -f "$creds" "$FIFO" "$REQUEST" "$LOG"
+    if [[ -n $connected ]]; then
+        # Keep only the running tunnel; re-authenticating always needs a new code.
+        "$SWANCTL" --load-creds --clear --noprompt --file "$SWAN_CONF" >/dev/null 2>&1 || true
+    else
+        drop_sa
+        rm -f "$ACTIVE"
+        systemctl stop "$SERVICE" || true
+    fi
+}
+
+explain_failure() {
+    local output=$1 codes_sent=$2
+    case $output in
+    *"rejecting EAP-Success"*)
+        echo "Stopped before sending a code: the gateway did not complete the password step"
+        echo "as expected. Your code was not sent to it."
+        ;;
+    *AUTHENTICATION_FAILED*)
+        echo "The gateway accepted your login but rejected the final IKE authentication."
+        echo "This needs a settings change in $PREFIX/etc/strongswan.d/fortigate.conf."
+        ;;
+    *EAP_FAILURE*)
+        if [[ $codes_sent -gt 0 ]]; then
+            echo "The gateway rejected the code: it was wrong or has expired."
+        else
+            echo "The gateway rejected your password or username."
+        fi
+        ;;
+    *NO_PROPOSAL_CHOSEN*)
+        echo "The gateway didn't accept the encryption proposals. Ask your VPN admin which"
+        echo "IKE and ESP proposals it uses, and change them in the connection's settings."
+        ;;
+    *retransmit* | *"timed out"* | *timeout*)
+        if [[ $codes_sent -gt 0 ]]; then
+            echo "The gateway stopped answering. It probably gave up waiting for the code:"
+            echo "its negotiate-timeout setting limits how long you have to enter it."
+        else
+            echo "The gateway did not answer. Check your network and try again."
+        fi
+        ;;
+    *)
+        echo "The connection failed for an unrecognised reason."
+        ;;
+    esac
+    echo "If you retry, use a new code. Repeated failures can lock your account."
+}
+
+# In --ui mode, a line or EOF on stdin while connecting means the GUI cancelled.
+check_cancel() {
+    local line
+    if read -r -t 0; then
+        IFS= read -r line || exit 130
+        [[ $line != cancel ]] || exit 130
+    fi
+}
+
+prompt_for_code() {
+    local codes_sent=$1 otp rc
+    if [[ $codes_sent -gt 0 ]]; then
+        say "The gateway asked again, so the last code was probably wrong."
+    else
+        say "Password accepted. The gateway is now sending your code."
+    fi
+    while :; do
+        event need-code "$codes_sent"
+        if [[ -n $ui ]]; then
+            IFS= read -r -t "$CODE_PROMPT_TIMEOUT" otp || {
+                rc=$?
+                ((rc <= 128)) || die "timed out waiting for the code"
+                exit 130
+            }
+        else
+            read -rp "Enter the code: " -t "$CODE_PROMPT_TIMEOUT" otp || die "timed out waiting for the code"
+        fi
+        otp=$(trim "$otp")
+        if [[ $otp =~ ^[0-9]{4,10}$ ]]; then
+            printf '%s\n' "$otp" >&3
+            return
+        fi
+        say "That doesn't look like a code: digits only."
+    done
+}
+
+connect() {
+    local id password output rc=0 codes_sent=0
+    pick "$1"
+    load_conn "$id"
+    [[ -r $CONN_DIR/$id.psk ]] || die "the connection $c_name has no pre-shared key"
+    systemctl start "$SERVICE" || die "could not start $SERVICE (see: journalctl -u $SERVICE)"
+    if is_up; then
+        if [[ $(active_id) == "$id" ]]; then
+            say "Already connected."
+            event connected
+            return
+        fi
+        die "already connected to another VPN; disconnect first"
+    fi
+
+    trap cleanup EXIT
+    trap 'exit 130' INT TERM
+    drop_sa # a half-open SA from an earlier failed attempt
+    rm -f "$ACTIVE"
+
+    write_swanctl_conf "$id"
+    output=$("$SWANCTL" --load-conns --file "$SWAN_CONF" 2>&1) ||
+        die "charon refused the connection settings: $output"
+
+    event need-password "$c_username"
+    if [[ -n $ui ]]; then
+        IFS= read -r password || exit 130
+    else
+        IFS= read -rsp "Password for $c_username: " password
+        echo
+    fi
+    [[ -n $password ]] || die "the password is empty"
+    load_password "$password"
+    unset password
+
+    rm -f "$FIFO" "$REQUEST"
+    mkfifo -m 600 "$FIFO"
+    # Opened read-write, so writing never blocks even if the helper has gone away.
+    exec 3<>"$FIFO"
+    fifo_open=1
+
+    say "Connecting to $c_name..."
+    event connecting
+    "$SWANCTL" --initiate --child "$CONN" --ike "$CONN" --timeout "$INITIATE_TIMEOUT" >"$LOG" 2>&1 </dev/null &
+    init_pid=$!
+
+    while kill -0 "$init_pid" 2>/dev/null; do
+        if [[ -e $REQUEST ]]; then
+            rm -f "$REQUEST"
+            prompt_for_code "$codes_sent"
+            codes_sent=$((codes_sent + 1))
+            say "Checking the code..."
+            event checking
+        else
+            [[ -z $ui ]] || check_cancel
+            sleep 0.2
+        fi
+    done
+    wait "$init_pid" || rc=$?
+    init_pid=
+
+    if [[ $rc -eq 0 ]] && is_up; then
+        connected=1
+        printf '%s\n' "$id" >"$ACTIVE"
+        chmod 644 "$ACTIVE"
+        say "Connected."
+        event connected
+        [[ -n $ui ]] || status
+        return
+    fi
+
+    output=$(cat "$LOG")
+    if [[ -n $ui ]]; then
+        printf '%s\n' "$output" | tail -n 12 | sed 's/^/log /'
+        explain_failure "$output" "$codes_sent" | sed 's/^/error /'
+    else
+        echo "$output" | tail -n 12
+        echo
+        explain_failure "$output" "$codes_sent"
+    fi
+    exit 1
+}
+
+disconnect() {
+    if is_up; then
+        "$SWANCTL" --terminate --ike "$CONN" --force --timeout 10 >/dev/null 2>&1 || true
+        say "Disconnected."
+    else
+        say "Not connected."
+    fi
+    rm -f "$ACTIVE"
+    systemctl stop "$SERVICE" || true
+    event disconnected
+}
+
+status() {
+    local id
+    if is_up; then
+        id=$(active_id)
+        if [[ -r $CONN_DIR/$id.conf ]]; then
+            echo "Connected to $(conf_get "$CONN_DIR/$id.conf" name)."
+        fi
+        "$SWANCTL" --list-sas --ike "$CONN"
+    else
+        echo "Not connected."
+    fi
+}
+
+# --- Main --------------------------------------------------------------------------------
+
+usage() {
+    echo "usage:" >&2
+    sed -n '4,10s/^#//p' "$(readlink -f "$0")" >&2
+    exit 2
+}
+
+args=()
+for arg; do
+    case $arg in
+    --ui) ui=1 ;;
+    -h | --help) usage ;;
+    -*) usage ;;
+    *) args+=("$arg") ;;
+    esac
+done
+cmd=${args[0]:-connect}
+target=${args[1]:-}
+case $cmd:${#args[@]} in
+connect:[012] | disconnect:1 | status:1 | list:1 | add:1 | save:[12]) ;;
+edit:2 | remove:2 | import:2) ;;
+*) usage ;;
+esac
+
+# Listing only reads files that are readable by everyone.
+if [[ $cmd != list && $EUID -ne 0 ]]; then
+    exec sudo -- "$(readlink -f "$0")" "$@"
+fi
+
+case $cmd in
+import) import_legacy "$target" ;;
+*) "$cmd" "$target" ;;
+esac

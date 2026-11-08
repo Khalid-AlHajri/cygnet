@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Stands in for cygnet, so the GUI can be tried out without a gateway or root:
+#
+#   dir=$(mktemp -d)
+#   CYGNET_CLI=tests/fake-cygnet CYGNET_CONN_DIR=$dir CYGNET_ACTIVE=$dir/active gui/cygnet-gui
+#
+# The password "wrong" is rejected, and so is the code 000000. Anything else works.
+set -eu
+dir=${CYGNET_CONN_DIR:?}
+active=${CYGNET_ACTIVE:?}
+args=()
+for arg; do [[ $arg == --ui ]] || args+=("$arg"); done
+
+case ${args[0]} in
+connect)
+    [[ ! -e $active ]] || { echo "error already connected to another VPN; disconnect first"; exit 1; }
+    echo "need-password $(sed -n 's/^username = //p' "$dir/${args[1]}.conf")"
+    IFS= read -r password || exit 130
+    echo connecting
+    sleep 1.5
+    if [[ $password == wrong ]]; then
+        echo "log EAP method EAP_MSCHAPV2 failed"
+        echo "error The gateway rejected your password or username."
+        echo "error If you retry, use a new code. Repeated failures can lock your account."
+        exit 1
+    fi
+    tries=0
+    while :; do
+        echo "need-code $tries"
+        read -r code || exit 130
+        echo checking
+        sleep 1.5
+        [[ $code == 000000 ]] || break
+        tries=$((tries + 1))
+    done
+    echo "${args[1]}" >"$active"
+    echo connected
+    ;;
+disconnect)
+    rm -f "$active"
+    echo disconnected
+    ;;
+save)
+    id=${args[1]:-}
+    declare -A v=()
+    [[ -z $id ]] || while IFS=' = ' read -r key value; do v[$key]=$value; done < <(grep ' = ' "$dir/$id.conf")
+    while IFS= read -r line; do v[${line%%=*}]=${line#*=}; done
+    [[ ${v[gateway]} != *' '* ]] || { echo "error The gateway is an IP address or hostname."; exit 1; }
+    if [[ -z $id ]]; then
+        id=$(printf %s "${v[name],,}" | tr -cs 'a-z0-9' - | sed 's/^-*//; s/-*$//')
+    fi
+    for key in name gateway username networks ike_proposals esp_proposals; do
+        echo "$key = ${v[$key]:-}"
+    done >"$dir/$id.conf"
+    echo "saved $id"
+    ;;
+remove)
+    rm -f "$dir/${args[1]}.conf"
+    echo removed
+    ;;
+esac

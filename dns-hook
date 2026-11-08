@@ -1,0 +1,56 @@
+#!/bin/sh
+# Called by charon's resolve plugin in place of resolvconf(8) when the gateway hands out DNS
+# servers: "-a <iface>" with the full list as nameserver lines on stdin, each time the list
+# changes, and "-d <iface>" when it is empty. Also called with -d when the service stops, in
+# case the tunnel never came down cleanly, so each undo step checks for its own state.
+#
+# The servers are only used with a full tunnel, which makes the LAN's DNS unreachable. With a
+# split tunnel the system's DNS keeps working, and the VPN's servers may not even be reachable.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# The connection in use, written by cygnet.
+CONF=/run/cygnet/swanctl.conf
+DROPIN=/run/systemd/resolved.conf.d/cygnet.conf
+RESOLVCONF_MARK=/run/cygnet-resolvconf
+SAVED=/run/cygnet-resolv.conf.saved
+
+add() {
+    lines=$(grep '^nameserver ')
+    [ -n "$lines" ] || return 0
+    grep -Eq '^[[:space:]]*remote_ts[[:space:]]*=.*0\.0\.0\.0/0' "$CONF" || return 0
+
+    if systemctl is-active --quiet systemd-resolved; then
+        # Global rather than per-interface settings: those would bind queries to one
+        # interface, and would overwrite what NetworkManager set on it.
+        servers=$(printf '%s\n' "$lines" | sed 's/^nameserver //' | tr '\n' ' ')
+        mkdir -p "${DROPIN%/*}"
+        printf '[Resolve]\nDNS=%s\nDomains=~.\n' "$servers" >"$DROPIN"
+        systemctl try-reload-or-restart systemd-resolved
+    elif command -v resolvconf >/dev/null; then
+        printf '%s\n' "$lines" | resolvconf -x -a cygnet
+        : >"$RESOLVCONF_MARK"
+    else
+        [ -e "$SAVED" ] || cp /etc/resolv.conf "$SAVED"
+        # Rewritten in place, as it may be a symlink or a bind mount.
+        printf '%s\n' "$lines" >/etc/resolv.conf
+    fi
+}
+
+remove() {
+    if [ -e "$DROPIN" ]; then
+        rm -f "$DROPIN"
+        systemctl try-reload-or-restart systemd-resolved
+    fi
+    if [ -e "$RESOLVCONF_MARK" ]; then
+        resolvconf -d cygnet
+        rm -f "$RESOLVCONF_MARK"
+    fi
+    if [ -e "$SAVED" ]; then
+        cat "$SAVED" >/etc/resolv.conf
+        rm -f "$SAVED"
+    fi
+}
+
+case ${1:-} in
+-a) add ;;
+-d) remove ;;
+esac

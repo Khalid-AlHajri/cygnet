@@ -1,0 +1,7 @@
+#!/bin/sh
+# Run by charon when the gateway asks for the OTP. Tells cygnet to prompt, then
+# prints the code it gets back; charon sends the first line of output to the gateway.
+RUN_DIR=/run/cygnet
+
+: >"$RUN_DIR/otp.request" || exit 1
+exec timeout 270 head -n 1 "$RUN_DIR/otp.fifo"

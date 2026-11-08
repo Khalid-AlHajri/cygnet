@@ -1,0 +1,19 @@
+[Unit]
+Description=Patched strongSwan daemon for Cygnet
+After=network-online.target
+# Both would need UDP ports 500 and 4500.
+Conflicts=strongswan.service strongswan-starter.service
+
+[Service]
+Type=notify
+# Nothing is loaded at start: cygnet loads the connection in use when you connect.
+ExecStart=/opt/cygnet/sbin/charon-systemd
+# If the daemon dies without taking the tunnel down, the kernel would keep sending all
+# traffic into a tunnel nothing serves, cutting off the network. charon uses table 220.
+ExecStopPost=-/opt/cygnet/libexec/dns-hook -d cygnet
+ExecStopPost=-ip xfrm policy flush
+ExecStopPost=-ip xfrm state flush
+ExecStopPost=-ip route flush table 220
+ExecStopPost=-rm -f /run/cygnet.active
+RuntimeDirectory=cygnet
+RuntimeDirectoryMode=0700

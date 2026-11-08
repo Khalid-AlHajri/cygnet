@@ -1,0 +1,4 @@
+# Connection settings from an earlier version, including the pre-shared key. install.sh
+# imports it.
+vpn.conf
+__pycache__/
