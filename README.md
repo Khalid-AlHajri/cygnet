@@ -161,6 +161,7 @@ Logs are in `journalctl -u cygnet`. They don't contain your password or code.
 | Symptom | Likely cause |
 |---|---|
 | Connected, but an internal host doesn't respond | It's missing from the connection's networks, or the gateway's firewall doesn't allow it. In `cygnet status`, `out` above 0 with `in` at 0 means nothing is coming back. |
+| `another program is using UDP ports 500 and 4500` | Another IPsec daemon is running, such as your distro's strongSwan or one left over from an older install. Only one can use those ports at a time. Stop the one the message names, then connect again. |
 | `The gateway stopped answering` after you enter the code | You ran out of time. The gateway's `negotiate-timeout` defaults to 30 seconds, and an admin can raise it. |
 | `rejected the final IKE authentication` | Try another `fortigate_auth_key` value in `strongswan-fortigate.conf`: `skp`, `msk` or `psk`. |
 | `Stopped before sending a code` | The gateway didn't complete the password step as expected. See [Security](#security). |

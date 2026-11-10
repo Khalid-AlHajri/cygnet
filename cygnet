@@ -468,6 +468,36 @@ EOF
     rm -f "$creds"
 }
 
+# charon keeps running when it can't open its UDP sockets, and then drops every packet it
+# sends, so connecting would only time out. The usual cause is another IPsec daemon that
+# already has the IKE ports. A gateway given by name may resolve to either address family,
+# so a socket of either family is enough for it.
+check_sockets() {
+    local pid sockets other name unit holders=
+    local -a family=()
+    pid=$(systemctl show --property MainPID --value "$SERVICE") || return 0
+    [[ $pid =~ ^[1-9][0-9]*$ ]] || return 0
+    case $c_gateway in
+    *:*) family=(-6) ;;
+    *[!0-9.]*) ;;
+    *) family=(-4) ;;
+    esac
+    sockets=$(ss -Hlunp "${family[@]}" 2>/dev/null) || return 0
+    [[ $sockets != *"pid=$pid,"* ]] || return 0
+
+    while read -r other name; do
+        [[ $other != "$pid" ]] || continue
+        unit=$(ps -o unit= -p "$other" 2>/dev/null | tr -d ' ') || unit=
+        [[ $unit == *.service && $unit != user@* ]] || unit=
+        holders+=$'\n'"  $name (pid $other${unit:+, $unit})"
+    done < <(ss -Hlunp '( sport = :500 or sport = :4500 )' 2>/dev/null |
+        grep -o '("[^"]*",pid=[0-9]*' | sed 's/^("\(.*\)",pid=\(.*\)$/\2 \1/' | sort -un)
+    if [[ -n $holders ]]; then
+        die "another program is using UDP ports 500 and 4500, which the VPN needs.$holders"$'\n'"Stop it, then connect again."
+    fi
+    die "the VPN daemon couldn't open the UDP ports it needs (see: journalctl -u $SERVICE)"
+}
+
 cleanup() {
     # Release the helper if it is still waiting, or charon stays blocked on it.
     if [[ -n $fifo_open ]]; then
@@ -577,6 +607,7 @@ connect() {
 
     trap cleanup EXIT
     trap 'exit 130' INT TERM
+    check_sockets
     drop_sa # a half-open SA from an earlier failed attempt
     rm -f "$ACTIVE"
 
