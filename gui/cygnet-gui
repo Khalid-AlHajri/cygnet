@@ -217,6 +217,7 @@ class ConnectionPage(Adw.NavigationPage):
         self.session = None
         self.password = None
         self.cancelled = False
+        self.code_rejected = False
         self.errors = []
         self.log = []
 
@@ -299,9 +300,10 @@ class ConnectionPage(Adw.NavigationPage):
     def busy_now(self):
         return self.session is not None
 
-    def show(self, name, title=None):
+    def show(self, name, title=None, description=""):
         if name == "busy":
             self.busy.set_title(title)
+            self.busy.set_description(GLib.markup_escape_text(description))
         self.stack.set_visible_child_name(name)
         self.set_can_pop(name not in ("busy", "code"))
         if name == "password":
@@ -351,7 +353,7 @@ class ConnectionPage(Adw.NavigationPage):
         self.password_row.remove_css_class("error")
         self.password_row.set_text("")
         self.password = password
-        self.cancelled = False
+        self.cancelled = self.code_rejected = False
         self.errors, self.log = [], []
         self.session = Session(self.conn["id"], self.on_event, self.on_exit)
         self.show("busy", "Signing In…")
@@ -379,13 +381,21 @@ class ConnectionPage(Adw.NavigationPage):
             self.password = None
         elif event == "connecting":
             self.show("busy", "Signing In…")
+        elif event == "code-rejected":
+            # cygnet signs in again with the same password, so the gateway sends a new code.
+            self.code_rejected = True
+            self.show("busy", "Requesting a New Code…", "The gateway rejected that code: it was wrong or had expired.")
         elif event == "need-code":
-            retry = arg not in ("", "0")
-            self.code_page.set_description(
-                "The gateway asked again, so the last code was probably wrong. Enter the new one."
-                if retry
-                else "Password accepted. The gateway is sending your code now, and only waits a short time for it."
-            )
+            if arg not in ("", "0"):
+                description = "The gateway asked again, so the last code was probably wrong. Enter the new one."
+            elif self.code_rejected:
+                description = (
+                    "The last code was wrong or had expired, so the gateway is sending a new one. "
+                    "Enter it soon, or cancel to stop."
+                )
+            else:
+                description = "Password accepted. The gateway is sending your code now, and only waits a short time for it."
+            self.code_page.set_description(description)
             self.show("code")
             self.window.notify_unless_focused(
                 "code", "Enter your VPN code", f"{self.conn['name']} is waiting for your one-time code.",

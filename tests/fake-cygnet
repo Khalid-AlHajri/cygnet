@@ -4,7 +4,9 @@
 #   dir=$(mktemp -d)
 #   CYGNET_CLI=tests/fake-cygnet CYGNET_CONN_DIR=$dir CYGNET_ACTIVE=$dir/active gui/cygnet-gui
 #
-# The password "wrong" is rejected, and so is the code 000000. Anything else works.
+# The password "wrong" is rejected, and so is the code 000000. Like a real gateway, a rejected
+# code is followed by a request for a new one, for 2 minutes after the first. Anything else
+# works.
 set -eu
 dir=${CYGNET_CONN_DIR:?}
 active=${CYGNET_ACTIVE:?}
@@ -24,14 +26,23 @@ connect)
         echo "error If you retry, use a new code. Repeated failures can lock your account."
         exit 1
     fi
-    tries=0
+    retry_until=
     while :; do
-        echo "need-code $tries"
+        echo "need-code 0"
         read -r code || exit 130
         echo checking
         sleep 1.5
         [[ $code == 000000 ]] || break
-        tries=$((tries + 1))
+        echo "log received EAP_FAILURE, EAP authentication failed"
+        retry_until=${retry_until:-$((SECONDS + 120))}
+        if ((SECONDS >= retry_until)); then
+            echo "error The gateway rejected the code: it was wrong or has expired."
+            echo "error New codes are only requested for 2 minutes after the first wrong one."
+            echo "error If you retry, use a new code. Repeated failures can lock your account."
+            exit 1
+        fi
+        echo code-rejected
+        sleep 1.5
     done
     echo "${args[1]}" >"$active"
     echo connected

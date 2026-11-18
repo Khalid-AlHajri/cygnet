@@ -129,6 +129,11 @@ cygnet remove "Head Office"
 Have your inbox or phone ready before connecting, because the gateway limits how long you have to
 enter the code. A dropped tunnel doesn't reconnect by itself, since that would need a new code.
 
+If the gateway rejects a code, Cygnet signs in again with the password you already gave, so the
+gateway sends a new code, and asks you for that one. It does this for 2 minutes after the first wrong
+code; after that, you start again with your password. To stop sooner, press **Cancel** in the app or
+Ctrl+C in the terminal. Each wrong code counts as a failed login, and too many can lock your account.
+
 ## Split or full tunnel
 
 A connection's networks decide what goes through the VPN.

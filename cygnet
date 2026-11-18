@@ -47,6 +47,9 @@ DEFAULT_ESP_PROPOSALS=aes256-sha256-modp2048,aes256-sha256
 # Longer than the helper's own wait, so the helper always gives up first.
 INITIATE_TIMEOUT=300
 CODE_PROMPT_TIMEOUT=240
+# After the gateway rejects a code, how long cygnet goes on signing in again for new codes
+# with the password it already has, before you have to enter the password again.
+CODE_RETRY_SECONDS=120
 
 ui=
 creds=
@@ -525,35 +528,55 @@ cleanup() {
     fi
 }
 
-explain_failure() {
+# Why signing in failed, as one word, from swanctl's log and the number of codes sent.
+failure_reason() {
     local output=$1 codes_sent=$2
     case $output in
-    *"rejecting EAP-Success"*)
+    *"rejecting EAP-Success"*) echo unproven-gateway ;;
+    *AUTHENTICATION_FAILED*) echo final-auth ;;
+    *EAP_FAILURE*) ((codes_sent > 0)) && echo wrong-code || echo wrong-password ;;
+    *NO_PROPOSAL_CHOSEN*) echo proposals ;;
+    *retransmit* | *"timed out"* | *timeout*) ((codes_sent > 0)) && echo code-timeout || echo no-answer ;;
+    *) echo unknown ;;
+    esac
+}
+
+# $2 is set when a code was rejected earlier in this attempt and cygnet signed in again.
+explain_failure() {
+    local reason=$1 retried=$2
+    case $reason in
+    unproven-gateway)
         echo "Stopped before sending a code: the gateway did not complete the password step"
         echo "as expected. Your code was not sent to it."
         ;;
-    *AUTHENTICATION_FAILED*)
+    final-auth)
         echo "The gateway accepted your login but rejected the final IKE authentication."
         echo "This needs a settings change in $PREFIX/etc/strongswan.d/fortigate.conf."
         ;;
-    *EAP_FAILURE*)
-        if [[ $codes_sent -gt 0 ]]; then
-            echo "The gateway rejected the code: it was wrong or has expired."
+    wrong-code)
+        echo "The gateway rejected the code: it was wrong or has expired."
+        if [[ -n $retried ]]; then
+            echo "New codes are only requested for $((CODE_RETRY_SECONDS / 60)) minutes after the first wrong one."
+        fi
+        ;;
+    wrong-password)
+        if [[ -n $retried ]]; then
+            echo "This time the gateway rejected your password. After wrong codes, that can mean"
+            echo "your account is locked for a while."
         else
             echo "The gateway rejected your password or username."
         fi
         ;;
-    *NO_PROPOSAL_CHOSEN*)
+    proposals)
         echo "The gateway didn't accept the encryption proposals. Ask your VPN admin which"
         echo "IKE and ESP proposals it uses, and change them in the connection's settings."
         ;;
-    *retransmit* | *"timed out"* | *timeout*)
-        if [[ $codes_sent -gt 0 ]]; then
-            echo "The gateway stopped answering. It probably gave up waiting for the code:"
-            echo "its negotiate-timeout setting limits how long you have to enter it."
-        else
-            echo "The gateway did not answer. Check your network and try again."
-        fi
+    code-timeout)
+        echo "The gateway stopped answering. It probably gave up waiting for the code:"
+        echo "its negotiate-timeout setting limits how long you have to enter it."
+        ;;
+    no-answer)
+        echo "The gateway did not answer. Check your network and try again."
         ;;
     *)
         echo "The connection failed for an unrecognised reason."
@@ -572,9 +595,11 @@ check_cancel() {
 }
 
 prompt_for_code() {
-    local codes_sent=$1 otp rc
+    local codes_sent=$1 retrying=$2 otp rc
     if [[ $codes_sent -gt 0 ]]; then
         say "The gateway asked again, so the last code was probably wrong."
+    elif [[ -n $retrying ]]; then
+        say "The gateway is now sending a new code."
     else
         say "Password accepted. The gateway is now sending your code."
     fi
@@ -598,8 +623,34 @@ prompt_for_code() {
     done
 }
 
+# Signs in with the password already loaded into charon, asking for a code each time the
+# gateway wants one. Sets rc to swanctl's exit status and codes_sent to the number of codes
+# sent. $1 is set when this is a sign-in again after a rejected code.
+sign_in() {
+    local retrying=$1
+    rc=0 codes_sent=0
+    rm -f "$REQUEST"
+    "$SWANCTL" --initiate --child "$CONN" --ike "$CONN" --timeout "$INITIATE_TIMEOUT" >"$LOG" 2>&1 </dev/null &
+    init_pid=$!
+
+    while kill -0 "$init_pid" 2>/dev/null; do
+        if [[ -e $REQUEST ]]; then
+            rm -f "$REQUEST"
+            prompt_for_code "$codes_sent" "$retrying"
+            codes_sent=$((codes_sent + 1))
+            say "Checking the code..."
+            event checking
+        else
+            [[ -z $ui ]] || check_cancel
+            sleep 0.2
+        fi
+    done
+    wait "$init_pid" || rc=$?
+    init_pid=
+}
+
 connect() {
-    local id password output rc=0 codes_sent=0
+    local id password output reason rc codes_sent retry_until=
     pick "$1"
     load_conn "$id"
     [[ -r $CONN_DIR/$id.psk ]] || die "the connection $c_name has no pre-shared key"
@@ -642,42 +693,38 @@ connect() {
 
     say "Connecting to $c_name..."
     event connecting
-    "$SWANCTL" --initiate --child "$CONN" --ike "$CONN" --timeout "$INITIATE_TIMEOUT" >"$LOG" 2>&1 </dev/null &
-    init_pid=$!
-
-    while kill -0 "$init_pid" 2>/dev/null; do
-        if [[ -e $REQUEST ]]; then
-            rm -f "$REQUEST"
-            prompt_for_code "$codes_sent"
-            codes_sent=$((codes_sent + 1))
-            say "Checking the code..."
-            event checking
-        else
-            [[ -z $ui ]] || check_cancel
-            sleep 0.2
+    while :; do
+        sign_in "$retry_until"
+        if [[ $rc -eq 0 ]] && is_up; then
+            connected=1
+            printf '%s\n' "$id" >"$ACTIVE"
+            chmod 644 "$ACTIVE"
+            say "Connected."
+            event connected
+            [[ -n $ui ]] || status
+            return
         fi
+
+        output=$(cat "$LOG")
+        reason=$(failure_reason "$output" "$codes_sent")
+        # A wrong code ends the gateway's session. Signing in again makes it send a new code,
+        # and the password is still loaded, so only the code has to be entered again.
+        [[ $reason == wrong-code ]] || break
+        retry_until=${retry_until:-$((SECONDS + CODE_RETRY_SECONDS))}
+        ((SECONDS < retry_until)) || break
+        say "The gateway rejected the code: it was wrong or has expired."
+        say "Signing in again for a new code. To stop instead, press Ctrl+C."
+        event code-rejected
+        drop_sa
     done
-    wait "$init_pid" || rc=$?
-    init_pid=
 
-    if [[ $rc -eq 0 ]] && is_up; then
-        connected=1
-        printf '%s\n' "$id" >"$ACTIVE"
-        chmod 644 "$ACTIVE"
-        say "Connected."
-        event connected
-        [[ -n $ui ]] || status
-        return
-    fi
-
-    output=$(cat "$LOG")
     if [[ -n $ui ]]; then
         printf '%s\n' "$output" | tail -n 12 | sed 's/^/log /'
-        explain_failure "$output" "$codes_sent" | sed 's/^/error /'
+        explain_failure "$reason" "$retry_until" | sed 's/^/error /'
     else
         echo "$output" | tail -n 12
         echo
-        explain_failure "$output" "$codes_sent"
+        explain_failure "$reason" "$retry_until"
     fi
     exit 1
 }
