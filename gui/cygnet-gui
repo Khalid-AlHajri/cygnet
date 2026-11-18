@@ -34,7 +34,7 @@ CONN_DIR = os.environ.get("CYGNET_CONN_DIR", "/opt/cygnet/etc/connections")
 ACTIVE = os.environ.get("CYGNET_ACTIVE", "/run/cygnet.active")
 
 DEFAULT_IKE = "aes256-sha256-modp2048"
-DEFAULT_ESP = "aes256-sha256"
+DEFAULT_ESP = "aes256-sha256-modp2048,aes256-sha256"
 POLL_SECONDS = 3
 PKEXEC_REFUSED = (126, 127)  # the admin password prompt was dismissed or failed
 

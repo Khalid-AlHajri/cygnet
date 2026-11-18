@@ -39,7 +39,10 @@ LOG=$RUN_DIR/initiate.log
 ACTIVE=/run/cygnet.active # id of the connected connection, readable by the GUI
 
 DEFAULT_IKE_PROPOSALS=aes256-sha256-modp2048
-DEFAULT_ESP_PROPOSALS=aes256-sha256
+# The key exchange group in an ESP proposal is only used when the tunnel is rekeyed, hours
+# after connecting. A gateway with perfect forward secrecy, FortiGate's default, refuses a
+# rekey without one; the second proposal is for gateways that have it turned off.
+DEFAULT_ESP_PROPOSALS=aes256-sha256-modp2048,aes256-sha256
 
 # Longer than the helper's own wait, so the helper always gives up first.
 INITIATE_TIMEOUT=300
@@ -384,13 +387,18 @@ active_id() {
     cat "$ACTIVE" 2>/dev/null || true
 }
 
+# Up means signed in to the gateway (the IKE SA) with a tunnel installed (its CHILD_SA).
+# The sign-in alone doesn't count: it outlives the tunnel when the gateway closes that or a
+# rekey fails, and goes on answering keepalives while no traffic can pass.
 is_up() {
     systemctl is-active --quiet "$SERVICE" || return 1
-    local sas
-    sas=$("$SWANCTL" --list-sas --ike "$CONN" 2>/dev/null) || return 1
-    [[ $sas == *ESTABLISHED* ]]
+    local nl=$'\n' sas
+    sas=$nl$("$SWANCTL" --list-sas --ike "$CONN" 2>/dev/null) || return 1
+    [[ $sas =~ "$nl$CONN: #"[0-9]+", "(ESTABLISHED|REKEYING)"," ]] &&
+        [[ $sas =~ "$nl  $CONN: #"[0-9]+", reqid "[0-9]+", "(INSTALLED|REKEYING)"," ]]
 }
 
+# Also signs out of the gateway, if a sign-in is left without its tunnel.
 drop_sa() {
     "$SWANCTL" --terminate --ike "$CONN" --force --timeout 5 >/dev/null 2>&1 || true
 }
@@ -608,7 +616,7 @@ connect() {
     trap cleanup EXIT
     trap 'exit 130' INT TERM
     check_sockets
-    drop_sa # a half-open SA from an earlier failed attempt
+    drop_sa # left by an earlier failed attempt, or by a tunnel that has since dropped
     rm -f "$ACTIVE"
 
     write_swanctl_conf "$id"
@@ -694,6 +702,10 @@ status() {
             echo "Connected to $(conf_get "$CONN_DIR/$id.conf" name)."
         fi
         "$SWANCTL" --list-sas --ike "$CONN"
+    elif [[ -e $ACTIVE ]]; then
+        # Only a disconnect or the daemon stopping removes this file.
+        echo "Not connected: the VPN dropped. Connecting again needs a new code."
+        echo "The reason is in: journalctl -u ${SERVICE%.service}"
     else
         echo "Not connected."
     fi
