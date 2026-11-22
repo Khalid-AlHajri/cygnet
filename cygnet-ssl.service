@@ -1,0 +1,16 @@
+[Unit]
+Description=openfortivpn tunnel for Cygnet's SSL VPN connections
+After=network-online.target
+
+[Service]
+# openfortivpn reports ready once the tunnel is up, so the unit stays "activating" while it
+# signs in, and "active" means connected.
+Type=notify
+NotifyAccess=main
+# cygnet writes the config for the connection in use, without the password. The password
+# and code come through ssl-pinentry, which cygnet feeds.
+ExecStart=/usr/bin/openfortivpn -c /run/cygnet-ssl/openfortivpn.conf --pinentry=/opt/cygnet/libexec/ssl-pinentry
+# Long enough to wait for a code, but a stuck sign-in still ends.
+TimeoutStartSec=600
+# Not restarted: signing in again needs a new code, so reconnecting has to be manual.
+Restart=no

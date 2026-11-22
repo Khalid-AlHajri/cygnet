@@ -6,20 +6,41 @@
 #
 # The password "wrong" is rejected, and so is the code 000000. Like a real gateway, a rejected
 # code is followed by a request for a new one, for 2 minutes after the first. Anything else
-# works.
+# works. An SSL connection asks you to trust its certificate until you do, and saves the
+# password once it works if you chose to save it.
 set -eu
 dir=${CYGNET_CONN_DIR:?}
 active=${CYGNET_ACTIVE:?}
 args=()
 for arg; do [[ $arg == --ui ]] || args+=("$arg"); done
+DIGEST=3f1c9a7e5b2d8046c1e9f7a3b5d2c8e04a6f1b9d7c3e5a2f8b0d4c6e1a9f7b3d
+
+get() { sed -n "s/^$2 = //p" "$dir/$1.conf"; }
 
 case ${args[0]} in
 connect)
+    id=${args[1]}
     [[ ! -e $active ]] || { echo "error already connected to another VPN; disconnect first"; exit 1; }
-    echo "need-password $(sed -n 's/^username = //p' "$dir/${args[1]}.conf")"
-    IFS= read -r password || exit 130
+    ssl=
+    [[ $(get "$id" type) != ssl ]] || ssl=1
+    if [[ -n $ssl && $(get "$id" save_password) == yes && -s $dir/$id.password ]]; then
+        password=$(<"$dir/$id.password")
+    else
+        echo "need-password $(get "$id" username)"
+        IFS= read -r password || exit 130
+    fi
     echo connecting
     sleep 1.5
+    if [[ -n $ssl && -z $(get "$id" trusted_cert) ]]; then
+        echo "cert-subject CN=*.example.com"
+        echo "cert-issuer C=GB, O=Sectigo Limited, CN=Sectigo Public Server Authentication CA DV R36"
+        echo "need-trust $DIGEST"
+        read -r answer || exit 130
+        [[ $answer == yes ]] || exit 130
+        sed -i "s/^trusted_cert = .*/trusted_cert = $DIGEST/" "$dir/$id.conf"
+        echo connecting
+        sleep 1
+    fi
     if [[ $password == wrong ]]; then
         echo "log EAP method EAP_MSCHAPV2 failed"
         echo "error The gateway rejected your password or username."
@@ -44,7 +65,12 @@ connect)
         echo code-rejected
         sleep 1.5
     done
-    echo "${args[1]}" >"$active"
+    if [[ -n $ssl ]]; then
+        [[ $(get "$id" save_password) != yes ]] || printf %s "$password" >"$dir/$id.password"
+        printf '%s\nppp0\n' "$id" >"$active"
+    else
+        echo "$id" >"$active"
+    fi
     echo connected
     ;;
 disconnect)
@@ -53,20 +79,39 @@ disconnect)
     ;;
 save)
     id=${args[1]:-}
-    declare -A v=()
+    declare -A v=([type]=ipsec [port]=443 [save_password]=no [trusted_cert]=)
     [[ -z $id ]] || while IFS=' = ' read -r key value; do v[$key]=$value; done < <(grep ' = ' "$dir/$id.conf")
-    while IFS= read -r line; do v[${line%%=*}]=${line#*=}; done
+    password=
+    while IFS= read -r line; do
+        key=${line%%=*}
+        case $key in
+        password) password=${line#*=} ;;
+        psk) ;;
+        type) [[ -n $id ]] || v[type]=${line#*=} ;;
+        *) v[$key]=${line#*=} ;;
+        esac
+    done
     [[ ${v[gateway]} != *' '* ]] || { echo "error The gateway is an IP address or hostname."; exit 1; }
     if [[ -z $id ]]; then
         id=$(printf %s "${v[name],,}" | tr -cs 'a-z0-9' - | sed 's/^-*//; s/-*$//')
     fi
-    for key in name gateway username networks ike_proposals esp_proposals; do
+    if [[ ${v[type]} == ssl ]]; then
+        keys=(type name gateway port username save_password trusted_cert)
+        if [[ ${v[save_password]} != yes ]]; then
+            rm -f "$dir/$id.password"
+        elif [[ -n $password ]]; then
+            printf %s "$password" >"$dir/$id.password"
+        fi
+    else
+        keys=(type name gateway username networks ike_proposals esp_proposals)
+    fi
+    for key in "${keys[@]}"; do
         echo "$key = ${v[$key]:-}"
     done >"$dir/$id.conf"
     echo "saved $id"
     ;;
 remove)
-    rm -f "$dir/${args[1]}.conf"
+    rm -f "$dir/${args[1]}.conf" "$dir/${args[1]}.password"
     echo removed
     ;;
 esac

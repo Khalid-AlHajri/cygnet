@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cygnet: connect to FortiGate IPsec VPNs that ask for a one-time code.
+# cygnet: connect to FortiGate VPNs that ask for a one-time code, over IPsec or SSL.
 #
 #   cygnet [connect] [NAME]   prompt for the password, then for the code once it is sent
 #   cygnet disconnect         take the tunnel down
@@ -12,16 +12,25 @@
 # NAME is a connection's name or id. It can be left out when there's only one connection.
 # One connection can be up at a time.
 #
-# Each connection is two files in $CONN_DIR: <id>.conf holds the settings and is readable
-# by everyone so the GUI can list it, and <id>.psk holds the pre-shared key and is readable
-# only by root. Only the connection in use is loaded into charon, as $SWAN_CONF.
+# A connection is IPsec (IKEv2, through the patched charon) or SSL (through openfortivpn).
+# Its settings are in $CONN_DIR/<id>.conf, which is readable by everyone so the GUI can
+# list it. Its secrets are readable only by root: <id>.psk holds an IPsec connection's
+# pre-shared key, and <id>.password an SSL connection's password, if you chose to save it.
 #
-# The gateway only sends the code after accepting the password, inside one IKE exchange.
-# charon runs otp-helper at that point, which blocks on a FIFO that this script feeds.
-# Neither the password nor the code is written to disk or passed on a command line.
+# IPsec: only the connection in use is loaded into charon, as $SWAN_CONF. The gateway only
+# sends the code after accepting the password, inside one IKE exchange. charon runs
+# otp-helper at that point, which blocks on a FIFO that this script feeds.
+#
+# SSL: openfortivpn runs as $SSL_SERVICE and asks ssl-pinentry for the password and code,
+# which blocks on a FIFO that this script feeds in the same way. A gateway certificate that
+# the system doesn't trust is shown once, and remembered if you trust it.
+#
+# The code is never written to disk, and neither is the password unless you save it for an
+# SSL connection. Neither is passed on a command line.
 #
 # With --ui, this talks to the Cygnet GUI instead of a terminal: it prints one event per
-# line on stdout and reads the password and code as lines on stdin. Closing stdin cancels.
+# line on stdout and reads the password, code and answers as lines on stdin. Closing stdin
+# cancels.
 set -eu
 umask 077
 
@@ -36,7 +45,16 @@ SWAN_CONF=$RUN_DIR/swanctl.conf
 FIFO=$RUN_DIR/otp.fifo
 REQUEST=$RUN_DIR/otp.request
 LOG=$RUN_DIR/initiate.log
-ACTIVE=/run/cygnet.active # id of the connected connection, readable by the GUI
+# The id of the connected connection, readable by the GUI. For SSL, its interface follows on
+# a second line.
+ACTIVE=/run/cygnet.active
+
+SSL_SERVICE=cygnet-ssl.service
+SSL_DIR=/run/cygnet-ssl # root-only, created by this script
+SSL_CONF=$SSL_DIR/openfortivpn.conf
+SSL_FIFO=$SSL_DIR/secret.fifo
+SSL_REQUEST=$SSL_DIR/request
+DEFAULT_SSL_PORT=443
 
 DEFAULT_IKE_PROPOSALS=aes256-sha256-modp2048
 # The key exchange group in an ESP proposal is only used when the tunnel is rekeyed, hours
@@ -99,10 +117,14 @@ conn_ids() {
     done
 }
 
-# Sets c_name, c_gateway, c_username, c_networks, c_ike and c_esp from connection $1.
+# Sets the c_ values from connection $1: c_type (ipsec or ssl), c_name, c_gateway and
+# c_username, then c_networks, c_ike and c_esp for IPsec, or c_port, c_save_password (yes or
+# no) and c_trusted_cert for SSL. A connection without a type is IPsec, as all were once.
 load_conn() {
     local f=$CONN_DIR/$1.conf
     [[ -r $f ]] || die "no connection with id $1"
+    c_type=$(conf_get "$f" type)
+    [[ $c_type == ssl ]] || c_type=ipsec
     c_name=$(conf_get "$f" name)
     c_gateway=$(conf_get "$f" gateway)
     c_username=$(conf_get "$f" username)
@@ -111,6 +133,11 @@ load_conn() {
     c_esp=$(conf_get "$f" esp_proposals)
     c_ike=${c_ike:-$DEFAULT_IKE_PROPOSALS}
     c_esp=${c_esp:-$DEFAULT_ESP_PROPOSALS}
+    c_port=$(conf_get "$f" port)
+    c_port=${c_port:-$DEFAULT_SSL_PORT}
+    c_save_password=$(conf_get "$f" save_password)
+    [[ $c_save_password == yes ]] || c_save_password=no
+    c_trusted_cert=$(conf_get "$f" trusted_cert)
 }
 
 # Sets id to the connection called $1 (a name or an id), or to the only one if $1 is empty.
@@ -168,6 +195,17 @@ check_gateway() {
     echo "The gateway is an IP address or hostname, such as vpn.example.com." >&2
     return 1
 }
+# openfortivpn only looks up IPv4 addresses, and the address can't carry a port.
+check_ssl_gateway() {
+    [[ $1 =~ ^[A-Za-z0-9.-]{1,253}$ ]] && printf %s "$1" && return
+    echo "The gateway is an IPv4 address or hostname, such as vpn.example.com, without a port." >&2
+    return 1
+}
+check_port() {
+    [[ $1 =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)) && printf %d "$((10#$1))" && return
+    echo "The port is a number from 1 to 65535, often 443 or 10443." >&2
+    return 1
+}
 check_username() {
     [[ ${#1} -le 256 && $1 =~ ^[^[:cntrl:][:space:]]+$ ]] && printf %s "$1" && return
     echo "The username can't be empty or contain spaces." >&2
@@ -203,13 +241,48 @@ check_proposals() {
     echo "Proposals look like aes256-sha256-modp2048, separated by commas." >&2
     return 1
 }
+# openfortivpn takes passwords of up to 256 bytes. A line break would end it early.
+check_password() {
+    [[ -n $1 && ${#1} -le 256 && $1 =~ ^[^[:cntrl:]]+$ ]] && printf %s "$1" && return
+    echo "Enter the VPN password: up to 256 characters, without line breaks." >&2
+    return 1
+}
+check_yes_no() {
+    case ${1,,} in
+    y | yes) echo yes ;;
+    n | no) echo no ;;
+    *)
+        echo "Answer yes or no." >&2
+        return 1
+        ;;
+    esac
+}
+check_type() {
+    case ${1,,} in
+    1 | ipsec) echo ipsec ;;
+    2 | ssl) echo ssl ;;
+    *)
+        echo "Answer 1 for IPsec or 2 for SSL VPN." >&2
+        return 1
+        ;;
+    esac
+}
 check_psk() {
     [[ -n $1 && ${#1} -le 1024 && $1 =~ ^[^[:cntrl:]]+$ ]] && printf %s "$1" && return
     echo "Enter the gateway's pre-shared key." >&2
     return 1
 }
 
-# Writes connection $id from the c_ values. c_psk may be empty to keep the current key.
+# Writes SECRET to the root-only file FILE, replacing it whole.
+write_secret() {
+    local tmp
+    tmp=$(mktemp -p "$CONN_DIR" .new.XXXXXX)
+    printf %s "$2" >"$tmp"
+    mv "$tmp" "$1"
+}
+
+# Writes connection $id from the c_ values. c_psk, and c_password, may be empty to keep the
+# current one. An SSL connection whose password isn't to be saved loses any saved one.
 write_conn() {
     local tmp other
     while read -r other; do
@@ -218,16 +291,34 @@ write_conn() {
         fi
     done < <(conn_ids)
     install -d -m 755 "$CONN_DIR"
-    if [[ -n $c_psk ]]; then
-        tmp=$(mktemp -p "$CONN_DIR" .new.XXXXXX)
-        printf %s "$c_psk" >"$tmp"
-        mv "$tmp" "$CONN_DIR/$id.psk"
+    if [[ $c_type == ssl ]]; then
+        if [[ $c_save_password == yes ]]; then
+            [[ -z $c_password ]] || write_secret "$CONN_DIR/$id.password" "$c_password"
+        else
+            rm -f "$CONN_DIR/$id.password"
+        fi
+    else
+        [[ -z $c_psk ]] || write_secret "$CONN_DIR/$id.psk" "$c_psk"
+        [[ -e $CONN_DIR/$id.psk ]] || die "a pre-shared key is needed"
     fi
-    [[ -e $CONN_DIR/$id.psk ]] || die "a pre-shared key is needed"
     tmp=$(mktemp -p "$CONN_DIR" .new.XXXXXX)
-    cat >"$tmp" <<EOF
+    if [[ $c_type == ssl ]]; then
+        cat >"$tmp" <<EOF
+# Cygnet connection. Change it with the Cygnet app or: cygnet edit $id
+# A saved password is in $id.password.
+type = ssl
+name = $c_name
+gateway = $c_gateway
+port = $c_port
+username = $c_username
+save_password = $c_save_password
+trusted_cert = $c_trusted_cert
+EOF
+    else
+        cat >"$tmp" <<EOF
 # Cygnet connection. Change it with the Cygnet app or: cygnet edit $id
 # The pre-shared key is in $id.psk.
+type = ipsec
 name = $c_name
 gateway = $c_gateway
 username = $c_username
@@ -235,8 +326,13 @@ networks = $c_networks
 ike_proposals = $c_ike
 esp_proposals = $c_esp
 EOF
+    fi
     chmod 644 "$tmp"
     mv "$tmp" "$CONN_DIR/$id.conf"
+}
+
+has_saved_password() {
+    [[ $c_type == ssl && $c_save_password == yes && -s $CONN_DIR/$1.password ]]
 }
 
 # Asks for a value in the terminal until VALIDATOR accepts it. An empty answer keeps DEFAULT.
@@ -269,62 +365,126 @@ ask_psk() {
     done
 }
 
+# Asks whether to save the password of an SSL connection, and for the password if so.
+# Leaving it empty keeps a saved one, or with none saved, asks for it when you next connect
+# and saves it once the gateway accepts it.
+ask_save_password() {
+    local saved=$1 v
+    ask c_save_password "Save the password on this computer? (yes/no)" "$c_save_password" check_yes_no
+    c_password=
+    [[ $c_save_password == yes ]] || return 0
+    while :; do
+        IFS= read -rsp "Password (Enter ${saved:+keeps the saved one}${saved:-asks when you connect}): " v
+        echo
+        [[ -n $v ]] || return 0
+        if v=$(check_password "$v"); then
+            c_password=$v
+            return
+        fi
+    done
+}
+
 add() {
     local id
+    echo "What kind of VPN is it?"
+    echo "  1) IPsec (IKEv2): the gateway is set up with a pre-shared key"
+    echo "  2) SSL VPN: openfortivpn, or FortiClient's SSL-VPN tab"
+    ask c_type "Type" "" check_type
     echo "Your VPN admin can tell you these. Press Ctrl+C to cancel."
     ask c_name "Name, such as Head Office" "" check_name
-    ask c_gateway "Gateway address" "" check_gateway
-    ask c_username "Username" "" check_username
-    ask_psk ""
-    ask c_networks "Networks to send through the VPN, or 0.0.0.0/0 for everything" "" check_networks
-    ask c_ike "IKE proposals" "$DEFAULT_IKE_PROPOSALS" check_proposals
-    ask c_esp "ESP proposals" "$DEFAULT_ESP_PROPOSALS" check_proposals
+    if [[ $c_type == ssl ]]; then
+        ask c_gateway "Gateway address" "" check_ssl_gateway
+        ask c_port "Port" "$DEFAULT_SSL_PORT" check_port
+        ask c_username "Username" "" check_username
+        c_save_password=no c_trusted_cert=
+        ask_save_password ""
+    else
+        ask c_gateway "Gateway address" "" check_gateway
+        ask c_username "Username" "" check_username
+        ask_psk ""
+        ask c_networks "Networks to send through the VPN, or 0.0.0.0/0 for everything" "" check_networks
+        ask c_ike "IKE proposals" "$DEFAULT_IKE_PROPOSALS" check_proposals
+        ask c_esp "ESP proposals" "$DEFAULT_ESP_PROPOSALS" check_proposals
+    fi
     new_id "$c_name"
     write_conn
     echo "Added $c_name. Connect with: cygnet connect $id"
 }
 
 edit() {
-    local id
+    local id gateway port saved=
     pick "$1"
     load_conn "$id"
     echo "Press Enter to keep a value, or Ctrl+C to cancel."
     ask c_name "Name" "$c_name" check_name
-    ask c_gateway "Gateway address" "$c_gateway" check_gateway
-    ask c_username "Username" "$c_username" check_username
-    ask_psk keep
-    ask c_networks "Networks to send through the VPN" "$c_networks" check_networks
-    ask c_ike "IKE proposals" "$c_ike" check_proposals
-    ask c_esp "ESP proposals" "$c_esp" check_proposals
+    if [[ $c_type == ssl ]]; then
+        gateway=$c_gateway port=$c_port
+        ! has_saved_password "$id" || saved=1
+        ask c_gateway "Gateway address" "$c_gateway" check_ssl_gateway
+        ask c_port "Port" "$c_port" check_port
+        ask c_username "Username" "$c_username" check_username
+        ask_save_password "$saved"
+        # A certificate trusted for one gateway says nothing about another.
+        [[ $c_gateway == "$gateway" && $c_port == "$port" ]] || c_trusted_cert=
+    else
+        ask c_gateway "Gateway address" "$c_gateway" check_gateway
+        ask c_username "Username" "$c_username" check_username
+        ask_psk keep
+        ask c_networks "Networks to send through the VPN" "$c_networks" check_networks
+        ask c_ike "IKE proposals" "$c_ike" check_proposals
+        ask c_esp "ESP proposals" "$c_esp" check_proposals
+    fi
     write_conn
     echo "Saved. Changes apply the next time you connect."
 }
 
 # For the GUI: reads name=..., gateway=... lines on stdin and saves them as connection $1,
-# or as a new connection if $1 is empty. psk may be left out to keep the current key.
+# or as a new connection if $1 is empty. A new connection's type=ipsec or type=ssl comes
+# first; an existing one keeps its type. psk, or password, may be left out to keep the
+# current one.
 save() {
-    local id=$1 line key value
-    c_name= c_gateway= c_username= c_networks= c_psk=
+    local id=$1 line key value gateway port
+    c_type=ipsec c_name= c_gateway= c_username= c_networks= c_psk= c_password=
     c_ike=$DEFAULT_IKE_PROPOSALS c_esp=$DEFAULT_ESP_PROPOSALS
+    c_port=$DEFAULT_SSL_PORT c_save_password=no c_trusted_cert=
     if [[ -n $id ]]; then
         [[ $id =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "invalid connection id"
         load_conn "$id"
     fi
+    gateway=$c_gateway port=$c_port
     while IFS= read -r line; do
         key=${line%%=*}
         value=${line#*=}
         case $key in
+        type)
+            [[ -z $id ]] || continue
+            c_type=$(check_type "$(trim "$value")" 2>&1) || die "$c_type"
+            ;;
         name) c_name=$(check_name "$(trim "$value")" 2>&1) || die "$c_name" ;;
-        gateway) c_gateway=$(check_gateway "$(trim "$value")" 2>&1) || die "$c_gateway" ;;
+        gateway)
+            if [[ $c_type == ssl ]]; then
+                c_gateway=$(check_ssl_gateway "$(trim "$value")" 2>&1) || die "$c_gateway"
+            else
+                c_gateway=$(check_gateway "$(trim "$value")" 2>&1) || die "$c_gateway"
+            fi
+            ;;
+        port) c_port=$(check_port "$(trim "$value")" 2>&1) || die "$c_port" ;;
         username) c_username=$(check_username "$(trim "$value")" 2>&1) || die "$c_username" ;;
         networks) c_networks=$(check_networks "$value" 2>&1) || die "$c_networks" ;;
         ike_proposals) c_ike=$(check_proposals "$value" 2>&1) || die "$c_ike" ;;
         esp_proposals) c_esp=$(check_proposals "$value" 2>&1) || die "$c_esp" ;;
         psk) [[ -z $value ]] || c_psk=$(check_psk "$value" 2>&1) || die "$c_psk" ;;
+        save_password) c_save_password=$(check_yes_no "$(trim "$value")" 2>&1) || die "$c_save_password" ;;
+        password) [[ -z $value ]] || c_password=$(check_password "$value" 2>&1) || die "$c_password" ;;
         esac
     done
-    [[ -n $c_name && -n $c_gateway && -n $c_username && -n $c_networks ]] ||
-        die "name, gateway, username and networks are all needed"
+    [[ -n $c_name && -n $c_gateway && -n $c_username ]] ||
+        die "name, gateway and username are all needed"
+    if [[ $c_type == ipsec ]]; then
+        [[ -n $c_networks ]] || die "networks are needed"
+    elif [[ $c_gateway != "$gateway" || $c_port != "$port" ]]; then
+        c_trusted_cert=
+    fi
     [[ -n $id ]] || new_id "$c_name"
     write_conn
     event "saved $id"
@@ -334,11 +494,11 @@ save() {
 remove() {
     local id
     pick "$1"
-    if [[ $(active_id) == "$id" ]] && is_up; then
+    if [[ $(active_id) == "$id" ]] && any_up; then
         die "that connection is in use; disconnect first"
     fi
     load_conn "$id"
-    rm -f "$CONN_DIR/$id.conf" "$CONN_DIR/$id.psk"
+    rm -f "$CONN_DIR/$id.conf" "$CONN_DIR/$id.psk" "$CONN_DIR/$id.password"
     event removed
     say "Removed $c_name."
 }
@@ -352,9 +512,13 @@ list() {
     fi
     while read -r id; do
         load_conn "$id"
-        printf '%s  %s\n    %s at %s, networks %s\n' \
-            "$([[ $id == "$active" ]] && echo '*' || echo ' ')" "$c_name ($id)" \
-            "$c_username" "$c_gateway" "$c_networks"
+        printf '%s  %s\n' "$([[ $id == "$active" ]] && echo '*' || echo ' ')" "$c_name ($id)"
+        if [[ $c_type == ssl ]]; then
+            printf '    SSL VPN: %s at %s:%s, password %s\n' "$c_username" "$c_gateway" "$c_port" \
+                "$([[ $c_save_password == yes ]] && echo saved || echo "asked each time")"
+        else
+            printf '    IPsec: %s at %s, networks %s\n' "$c_username" "$c_gateway" "$c_networks"
+        fi
     done < <(conn_ids)
 }
 
@@ -378,7 +542,7 @@ import_legacy() {
         c_ike=$(check_proposals "${c_ike:-$DEFAULT_IKE_PROPOSALS}") &&
         c_esp=$(check_proposals "${c_esp:-$DEFAULT_ESP_PROPOSALS}") &&
         c_psk=$(check_psk "$c_psk") || die "couldn't import $file"
-    c_name=$c_gateway
+    c_type=ipsec c_name=$c_gateway
     new_id "$c_name"
     write_conn
     echo "Imported $file as the connection \"$c_name\"."
@@ -387,7 +551,7 @@ import_legacy() {
 # --- Tunnel ------------------------------------------------------------------------------
 
 active_id() {
-    cat "$ACTIVE" 2>/dev/null || true
+    head -n 1 "$ACTIVE" 2>/dev/null || true
 }
 
 # Up means signed in to the gateway (the IKE SA) with a tunnel installed (its CHILD_SA).
@@ -399,6 +563,15 @@ is_up() {
     sas=$nl$("$SWANCTL" --list-sas --ike "$CONN" 2>/dev/null) || return 1
     [[ $sas =~ "$nl$CONN: #"[0-9]+", "(ESTABLISHED|REKEYING)"," ]] &&
         [[ $sas =~ "$nl  $CONN: #"[0-9]+", reqid "[0-9]+", "(INSTALLED|REKEYING)"," ]]
+}
+
+# openfortivpn tells systemd it's ready once the tunnel is up, so "active" means connected.
+ssl_is_up() {
+    systemctl is-active --quiet "$SSL_SERVICE"
+}
+
+any_up() {
+    is_up || ssl_is_up
 }
 
 # Also signs out of the gateway, if a sign-in is left without its tunnel.
@@ -567,6 +740,13 @@ explain_failure() {
             echo "The gateway rejected your password or username."
         fi
         ;;
+    wrong-saved-password)
+        echo "The gateway rejected the saved password, or the username. Cygnet has forgotten the"
+        echo "password, so you'll be asked for it next time, and it's saved again once it works."
+        ;;
+    no-resolve)
+        echo "The gateway's address couldn't be looked up. Check it, and your network."
+        ;;
     proposals)
         echo "The gateway didn't accept the encryption proposals. Ask your VPN admin which"
         echo "IKE and ESP proposals it uses, and change them in the connection's settings."
@@ -649,11 +829,11 @@ sign_in() {
     init_pid=
 }
 
-connect() {
-    local id password output reason rc codes_sent retry_until=
-    pick "$1"
-    load_conn "$id"
+ipsec_connect() {
+    local password output reason rc codes_sent retry_until=
     [[ -r $CONN_DIR/$id.psk ]] || die "the connection $c_name has no pre-shared key"
+    # Checked first, as stopping the IPsec daemon after a failed attempt clears $ACTIVE.
+    ! ssl_running || die "already connected to another VPN, or connecting; disconnect first"
     systemctl start "$SERVICE" || die "could not start $SERVICE (see: journalctl -u $SERVICE)"
     if is_up; then
         if [[ $(active_id) == "$id" ]]; then
@@ -729,30 +909,318 @@ connect() {
     exit 1
 }
 
+connect() {
+    local id
+    pick "$1"
+    load_conn "$id"
+    if [[ $c_type == ssl ]]; then
+        ssl_connect
+    else
+        ipsec_connect
+    fi
+}
+
+# --- SSL tunnel --------------------------------------------------------------------------
+
+ssl_state() {
+    systemctl is-active "$SSL_SERVICE" 2>/dev/null || true
+}
+
+# Connected, or signing in.
+ssl_running() {
+    case $(ssl_state) in
+    active | activating | deactivating | reloading) return 0 ;;
+    esac
+    return 1
+}
+
+# openfortivpn's config for the c_ connection, without the password.
+ssl_write_conf() {
+    {
+        echo "# Written by cygnet for the connection $id. The password comes from ssl-pinentry."
+        echo "host = $c_gateway"
+        echo "port = $c_port"
+        echo "username = $c_username"
+        if [[ -n $c_trusted_cert ]]; then
+            echo "trusted-cert = $c_trusted_cert"
+        fi
+    } >"$SSL_CONF"
+}
+
+# What openfortivpn logged in the service's latest run.
+ssl_log() {
+    local inv
+    journalctl --sync >/dev/null 2>&1 || true
+    inv=$(systemctl show --property InvocationID --value "$SSL_SERVICE" 2>/dev/null) || inv=
+    [[ -n $inv ]] || return 0
+    journalctl --quiet --no-pager --output cat "_SYSTEMD_INVOCATION_ID=$inv" 2>/dev/null || true
+}
+
+# Sets cert_subject, cert_issuer and cert_digest from openfortivpn's log, if it stopped
+# because the system doesn't trust the gateway's certificate, or returns 1.
+parse_untrusted_cert() {
+    local line part=
+    cert_subject= cert_issuer= cert_digest=
+    [[ $1 == *"Gateway certificate validation failed"* ]] || return 1
+    while IFS= read -r line; do
+        line=$(trim "${line#ERROR:}")
+        case $line in
+        subject:) part=subject ;;
+        issuer:) part=issuer ;;
+        "sha256 digest:") part=digest ;;
+        *)
+            case $part in
+            subject) cert_subject+=${cert_subject:+, }$line ;;
+            issuer) cert_issuer+=${cert_issuer:+, }$line ;;
+            digest)
+                # It's printed again when signing out fails, so the first one is enough.
+                cert_digest=$line
+                break
+                ;;
+            esac
+            ;;
+        esac
+    done <<<"$1"
+    [[ $cert_digest =~ ^[0-9a-f]{64}$ ]]
+}
+
+# Shows the certificate from parse_untrusted_cert and asks whether to trust it from now on.
+ask_trust() {
+    local changed= answer
+    [[ -z $c_trusted_cert ]] || changed=1
+    if [[ -n $ui ]]; then
+        event cert-subject "$cert_subject"
+        event cert-issuer "$cert_issuer"
+        event need-trust "$cert_digest" ${changed:+changed}
+        IFS= read -r answer || exit 130
+        [[ $answer == yes ]] || exit 130
+        return
+    fi
+    if [[ -n $changed ]]; then
+        echo "The gateway's certificate has changed since you trusted it. That's expected when"
+        echo "it's renewed, but it could also mean that something is pretending to be the gateway."
+    else
+        echo "This computer can't verify the gateway's certificate, so it needs your OK once."
+    fi
+    echo "  subject: $cert_subject"
+    echo "  issuer:  $cert_issuer"
+    echo "  sha256:  $cert_digest"
+    echo "If you can, check with your VPN admin that this is the gateway's certificate."
+    ask answer "Trust it from now on? (yes/no)" "" check_yes_no
+    [[ $answer == yes ]] || die "not connecting, as the gateway's certificate isn't trusted"
+}
+
+# Why signing in failed, as one word, from openfortivpn's log and the number of codes sent.
+# The gateway only asks for a code once it has accepted the password.
+ssl_failure_reason() {
+    local output=$1 codes_sent=$2
+    case $output in
+    *"Could not authenticate to gateway"*) ((codes_sent > 0)) && echo wrong-code || echo wrong-password ;;
+    *getaddrinfo:*) echo no-resolve ;;
+    *"connect: "*) echo no-answer ;;
+    *) echo unknown ;;
+    esac
+}
+
+ssl_cleanup() {
+    if [[ -n $init_pid ]]; then
+        kill "$init_pid" 2>/dev/null || true
+    fi
+    if [[ -z $connected ]]; then
+        # Before the tunnel is up, this ends openfortivpn at once, and ssl-pinentry with it.
+        systemctl stop "$SSL_SERVICE" 2>/dev/null || true
+    fi
+    rm -f "$SSL_FIFO" "$SSL_REQUEST"
+}
+
+# Starts openfortivpn, and answers ssl-pinentry with the password and the codes you enter,
+# until the tunnel is up or openfortivpn gives up. Sets rc to 0 once the tunnel is up, and
+# codes_sent to the number of codes sent. $1 is set when this is a sign-in again after a
+# rejected code.
+ssl_sign_in() {
+    local retrying=$1 request
+    rc=0 codes_sent=0
+    rm -f "$SSL_REQUEST"
+    systemctl reset-failed "$SSL_SERVICE" 2>/dev/null || true
+    # This returns once openfortivpn says the tunnel is up, or fails when it exits before.
+    systemctl start "$SSL_SERVICE" >/dev/null 2>&1 </dev/null &
+    init_pid=$!
+
+    while kill -0 "$init_pid" 2>/dev/null; do
+        if [[ -e $SSL_REQUEST ]]; then
+            request=$(<"$SSL_REQUEST")
+            rm -f "$SSL_REQUEST"
+            if [[ $request == password ]]; then
+                printf '%s\n' "$password" >&3
+            else
+                prompt_for_code "$codes_sent" "$retrying"
+                codes_sent=$((codes_sent + 1))
+                say "Checking the code..."
+                event checking
+            fi
+        else
+            [[ -z $ui ]] || check_cancel
+            sleep 0.2
+        fi
+    done
+    wait "$init_pid" || rc=$?
+    init_pid=
+}
+
+ssl_connect() {
+    local password output reason rc codes_sent saved= trusted= iface retry_until=
+    local cert_subject cert_issuer cert_digest
+    if ssl_is_up; then
+        if [[ $(active_id) == "$id" ]]; then
+            say "Already connected."
+            event connected
+            return
+        fi
+        die "already connected to another VPN; disconnect first"
+    fi
+    ! ssl_running || die "another connection attempt is in progress"
+    # The IPsec daemon only runs while connected, or after its tunnel dropped.
+    ! systemctl is-active --quiet "$SERVICE" || die "already connected to another VPN; disconnect first"
+    rm -f "$ACTIVE"
+
+    if has_saved_password "$id"; then
+        password=$(<"$CONN_DIR/$id.password")
+        saved=1
+    else
+        event need-password "$c_username"
+        if [[ -n $ui ]]; then
+            IFS= read -r password || exit 130
+        else
+            IFS= read -rsp "Password for $c_username: " password
+            echo
+        fi
+        [[ -n $password ]] || die "the password is empty"
+        password=$(check_password "$password" 2>&1) || die "$password"
+    fi
+
+    trap ssl_cleanup EXIT
+    trap 'exit 130' INT TERM
+    install -d -m 700 "$SSL_DIR"
+    rm -f "$SSL_FIFO" "$SSL_REQUEST"
+    mkfifo -m 600 "$SSL_FIFO"
+    # Opened read-write, so writing never blocks even if the helper has gone away.
+    exec 3<>"$SSL_FIFO"
+
+    say "Connecting to $c_name..."
+    event connecting
+    while :; do
+        ssl_write_conf
+        ssl_sign_in "$retry_until"
+        if [[ $rc -eq 0 ]] && ssl_is_up; then
+            connected=1
+            output=$(ssl_log)
+            iface=
+            if [[ $output =~ Interface\ ([^[:space:]]+)\ is\ UP ]]; then
+                iface=${BASH_REMATCH[1]}
+            fi
+            printf '%s\n%s\n' "$id" "$iface" >"$ACTIVE"
+            chmod 644 "$ACTIVE"
+            if [[ $c_save_password == yes && -z $saved ]]; then
+                write_secret "$CONN_DIR/$id.password" "$password"
+                say "Saved the password for next time."
+            fi
+            say "Connected."
+            event connected
+            [[ -n $ui ]] || status
+            return
+        fi
+
+        output=$(ssl_log)
+        if parse_untrusted_cert "$output"; then
+            # Trusted a moment ago, so something else is wrong with it.
+            [[ $cert_digest != "$trusted" ]] || break
+            ask_trust
+            trusted=$cert_digest
+            c_trusted_cert=$cert_digest c_password= c_psk=
+            write_conn
+            say "Trusted. Connecting..."
+            event connecting
+            continue
+        fi
+        reason=$(ssl_failure_reason "$output" "$codes_sent")
+        # A wrong code ends the sign-in. Signing in again makes the gateway send a new code,
+        # and the password is still at hand, so only the code has to be entered again.
+        [[ $reason == wrong-code ]] || break
+        retry_until=${retry_until:-$((SECONDS + CODE_RETRY_SECONDS))}
+        ((SECONDS < retry_until)) || break
+        say "The gateway rejected the code: it was wrong or has expired."
+        say "Signing in again for a new code. To stop instead, press Ctrl+C."
+        event code-rejected
+    done
+    unset password
+
+    reason=${reason:-unknown}
+    if [[ $reason == wrong-password && -n $saved && -z $retry_until ]]; then
+        rm -f "$CONN_DIR/$id.password"
+        reason=wrong-saved-password
+    fi
+    output=$(printf '%s\n' "$output" | grep -v '^$' | tail -n 12)
+    if [[ -n $ui ]]; then
+        printf '%s\n' "$output" | sed 's/^/log /'
+        explain_failure "$reason" "$retry_until" | sed 's/^/error /'
+    else
+        echo "$output"
+        echo
+        explain_failure "$reason" "$retry_until"
+    fi
+    exit 1
+}
+
+# --- Both --------------------------------------------------------------------------------
+
 disconnect() {
-    if is_up; then
-        "$SWANCTL" --terminate --ike "$CONN" --force --timeout 10 >/dev/null 2>&1 || true
+    if any_up; then
         say "Disconnected."
     else
         say "Not connected."
     fi
+    if is_up; then
+        "$SWANCTL" --terminate --ike "$CONN" --force --timeout 10 >/dev/null 2>&1 || true
+    fi
+    # openfortivpn takes its routes and DNS servers down as it stops.
+    systemctl stop "$SSL_SERVICE" 2>/dev/null || true
     rm -f "$ACTIVE"
     systemctl stop "$SERVICE" || true
     event disconnected
 }
 
 status() {
-    local id
+    local id iface routes type=ipsec
+    id=$(active_id)
+    if [[ -n $id && -r $CONN_DIR/$id.conf ]]; then
+        [[ $(conf_get "$CONN_DIR/$id.conf" type) != ssl ]] || type=ssl
+    fi
     if is_up; then
-        id=$(active_id)
         if [[ -r $CONN_DIR/$id.conf ]]; then
             echo "Connected to $(conf_get "$CONN_DIR/$id.conf" name)."
         fi
         "$SWANCTL" --list-sas --ike "$CONN"
+    elif ssl_is_up; then
+        if [[ -r $CONN_DIR/$id.conf ]]; then
+            echo "Connected to $(conf_get "$CONN_DIR/$id.conf" name) (SSL VPN)."
+        fi
+        iface=$(sed -n 2p "$ACTIVE" 2>/dev/null) || iface=
+        if [[ -n $iface ]]; then
+            ip -4 address show dev "$iface" 2>/dev/null | sed -n 's/^ *inet /address /p'
+            routes=$(ip -4 route show dev "$iface" 2>/dev/null) || routes=
+            if [[ -n $routes ]]; then
+                echo "networks through the VPN, set by the gateway:"
+                printf '%s\n' "$routes" | sed 's/^/  /'
+            fi
+        fi
     elif [[ -e $ACTIVE ]]; then
-        # Only a disconnect or the daemon stopping removes this file.
+        # Only a disconnect or the IPsec daemon stopping removes this file.
         echo "Not connected: the VPN dropped. Connecting again needs a new code."
-        echo "The reason is in: journalctl -u ${SERVICE%.service}"
+        if [[ $type == ssl ]]; then
+            echo "The reason is in: journalctl -u ${SSL_SERVICE%.service}"
+        else
+            echo "The reason is in: journalctl -u ${SERVICE%.service}"
+        fi
     else
         echo "Not connected."
     fi

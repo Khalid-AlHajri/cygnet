@@ -2,10 +2,10 @@
 Type=Application
 Name=Cygnet
 GenericName=VPN Client
-Comment=Connect to FortiGate VPNs that ask for a one-time code
+Comment=Connect to FortiGate IPsec and SSL VPNs that ask for a one-time code
 Exec=cygnet-gui
 Icon=io.github.Khalid_AlHajri.Cygnet
 Terminal=false
 Categories=Network;GTK;
-Keywords=VPN;FortiGate;IPsec;IKEv2;OTP;2FA;
+Keywords=VPN;FortiGate;IPsec;IKEv2;SSL;SSL-VPN;openfortivpn;OTP;2FA;
 StartupNotify=true

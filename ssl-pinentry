@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Run by openfortivpn, through --pinentry, each time it needs the password or the code. It
+# speaks just enough of the pinentry protocol for that: the secret it is asked for is named
+# by SETKEYINFO, and GETPIN gets it. The same as otp-helper does for IPsec, it tells cygnet
+# what is wanted in the request file, then blocks on the FIFO that cygnet feeds. An empty
+# line, or no answer in time, cancels.
+RUN_DIR=${CYGNET_SSL_DIR:-/run/cygnet-ssl}
+
+keyinfo=
+echo "OK Cygnet"
+while IFS= read -r line; do
+    case $line in
+    "SETKEYINFO "*) keyinfo=${line#SETKEYINFO } ;;
+    GETPIN)
+        # openfortivpn's hints end in _password for the password, and _2fa or _otp for a code.
+        case $keyinfo in
+        *_password) what=password ;;
+        *) what=code ;;
+        esac
+        secret=
+        if printf '%s\n' "$what" >"$RUN_DIR/request"; then
+            # timeout also covers opening the FIFO, which blocks if cygnet has gone away.
+            secret=$(timeout 270 head -n 1 "$RUN_DIR/secret.fifo") || secret=
+        fi
+        if [[ -z $secret ]]; then
+            echo "ERR 83886179 Operation cancelled"
+            continue
+        fi
+        # Percent-escaped, as the protocol needs for % and line breaks.
+        secret=${secret//%/%25}
+        secret=${secret//$'\r'/%0D}
+        printf 'D %s\nOK\n' "$secret"
+        unset secret
+        continue
+        ;;
+    BYE)
+        echo OK
+        exit 0
+        ;;
+    esac
+    echo OK
+done

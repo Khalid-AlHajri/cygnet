@@ -2,9 +2,10 @@
 """Cygnet: a small GTK window for the cygnet command.
 
 The window never handles the tunnel itself. It reads the connection files, which are
-readable by everyone apart from the pre-shared keys, and runs `cygnet` through pkexec for
-everything else. `cygnet connect --ui` reports progress as one event per line on stdout
-and reads the password and code from stdin; closing stdin cancels it.
+readable by everyone apart from the pre-shared keys and saved passwords, and runs `cygnet`
+through pkexec for everything else. `cygnet connect --ui` reports progress as one event per
+line on stdout, and reads the password, code and answers from stdin; closing stdin cancels
+it. A connection is IPsec, through cygnet's own strongSwan, or SSL, through openfortivpn.
 
 Closing the window keeps the app running in the background, so it can tell you when the
 code is needed or the VPN drops. Opening Cygnet again brings the window back. Quit in the
@@ -21,10 +22,11 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+gi.require_version("Pango", "1.0")
+from gi.repository import Adw, Gio, GLib, Gtk, Pango  # noqa: E402
 
 APP_ID = "io.github.Khalid_AlHajri.Cygnet"
-VERSION = "1.0"
+VERSION = "1.1"
 WEBSITE = "https://github.com/Khalid-AlHajri/cygnet"
 
 # These can be overridden to try the window out against tests/fake-cygnet.
@@ -32,19 +34,23 @@ FAKE_CLI = os.environ.get("CYGNET_CLI")
 COMMAND = [FAKE_CLI] if FAKE_CLI else ["pkexec", "/usr/local/bin/cygnet"]
 CONN_DIR = os.environ.get("CYGNET_CONN_DIR", "/opt/cygnet/etc/connections")
 ACTIVE = os.environ.get("CYGNET_ACTIVE", "/run/cygnet.active")
+SSL_SERVICE = "cygnet-ssl.service"
 
 DEFAULT_IKE = "aes256-sha256-modp2048"
 DEFAULT_ESP = "aes256-sha256-modp2048,aes256-sha256"
+DEFAULT_SSL_PORT = "443"
 POLL_SECONDS = 3
 PKEXEC_REFUSED = (126, 127)  # the admin password prompt was dismissed or failed
 
 # The same rules as the checks in cygnet, which has the final say.
 NAME_RE = re.compile(r"[^\x00-\x1f\x7f]{1,64}")
 GATEWAY_RE = re.compile(r"[A-Za-z0-9.:-]{1,253}")
+SSL_GATEWAY_RE = re.compile(r"[A-Za-z0-9.-]{1,253}")
 USERNAME_RE = re.compile(r"[^\x00-\x20\x7f]{1,128}")
 NETWORK_RE = re.compile(r"(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?:/(\d{1,2}))?")
 PROPOSALS_RE = re.compile(r"[a-z0-9_-]+(,[a-z0-9_-]+)*")
 PSK_RE = re.compile(r"[^\x00-\x1f\x7f]{1,1024}")
+PASSWORD_RE = re.compile(r"[^\x00-\x1f\x7f]{1,256}")
 CODE_RE = re.compile(r"\d{4,10}")
 
 
@@ -55,6 +61,30 @@ def valid_networks(text):
         if not m or any(int(x) > 255 for x in m.groups()[:4]) or int(m.group(5) or 0) > 32:
             return False
     return bool(nets)
+
+
+def valid_port(text):
+    return text.isdigit() and 1 <= int(text) <= 65535
+
+
+def is_ssl(conn):
+    return conn.get("type") == "ssl"
+
+
+def has_saved_password(conn):
+    """Whether cygnet has this SSL connection's password. Only root can read the file, but
+    anyone can see that it's there."""
+    return (
+        is_ssl(conn)
+        and conn.get("save_password") == "yes"
+        and os.path.exists(os.path.join(CONN_DIR, conn["id"] + ".password"))
+    )
+
+
+def describe(conn):
+    if is_ssl(conn):
+        return f"{conn.get('username', '')} at {conn.get('gateway', '')}:{conn.get('port', DEFAULT_SSL_PORT)}"
+    return f"{conn.get('username', '')} at {conn.get('gateway', '')}"
 
 
 def read_connections():
@@ -81,20 +111,42 @@ def read_connections():
     return sorted(conns, key=lambda c: c["name"].lower())
 
 
-def read_tunnel():
+def run_quietly(args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def read_tunnel(conns):
     """(id of the connected connection, its address, connected-since time), or Nones.
 
-    The active file says which connection was brought up. Whether it is still up comes from
-    the routes charon keeps in table 220, which anyone can read.
+    The active file says which connection was brought up, and for SSL, its interface.
+    Whether it is still up comes from what anyone can read: for IPsec, the routes charon
+    keeps in table 220, and for SSL, whether openfortivpn's service is active.
     """
     try:
         with open(ACTIVE) as f:
-            conn_id = f.read().strip()
+            lines = f.read().splitlines()
         since = os.stat(ACTIVE).st_mtime
     except OSError:
         return None, None, None
+    conn_id = lines[0].strip() if lines else ""
+    iface = lines[1].strip() if len(lines) > 1 else ""
+    if not conn_id:
+        return None, None, None
     if FAKE_CLI:
         return conn_id, "10.212.0.5", since
+    if any(c["id"] == conn_id and is_ssl(c) for c in conns):
+        state = run_quietly(["systemctl", "is-active", "--quiet", SSL_SERVICE])
+        if state is None or state.returncode != 0:
+            return None, None, None
+        address = None
+        if re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", iface):
+            out = run_quietly(["ip", "-4", "-o", "address", "show", "dev", iface])
+            m = re.search(r"\binet (\d+\.\d+\.\d+\.\d+)", out.stdout if out else "")
+            address = m.group(1) if m else None
+        return conn_id, address, since
     try:
         routes = subprocess.run(
             ["ip", "-4", "route", "show", "table", "220"],
@@ -220,6 +272,7 @@ class ConnectionPage(Adw.NavigationPage):
         self.code_rejected = False
         self.errors = []
         self.log = []
+        self.cert = {}
 
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
         view = Adw.ToolbarView(content=self.stack)
@@ -262,6 +315,23 @@ class ConnectionPage(Adw.NavigationPage):
         self.code_page.set_child(column(group, check, cancel))
         self.stack.add_named(self.code_page, "code")
 
+        # Trusting an SSL gateway's certificate, the first time or after it changes
+        self.subject_row = self._info_row("Subject")
+        self.issuer_row = self._info_row("Issuer")
+        self.digest_row = self._info_row("SHA-256")
+        self.digest_row.value.add_css_class("monospace")
+        group = Adw.PreferencesGroup()
+        for row in (self.subject_row, self.issuer_row, self.digest_row):
+            group.add(row)
+        trust = pill("Trust and Connect", "suggested-action")
+        trust.connect("clicked", lambda _: self.trust())
+        cancel = Gtk.Button(label="Cancel", halign=Gtk.Align.CENTER)
+        cancel.add_css_class("flat")
+        cancel.connect("clicked", lambda _: self.cancel())
+        self.trust_page = status_page("dialog-warning-symbolic", "Trust This Gateway?")
+        self.trust_page.set_child(column(group, trust, cancel))
+        self.stack.add_named(self.trust_page, "trust")
+
         # Connected
         self.address_row = self._info_row("Address")
         self.networks_row = self._info_row("Networks")
@@ -290,7 +360,7 @@ class ConnectionPage(Adw.NavigationPage):
     @staticmethod
     def _info_row(title):
         row = Adw.ActionRow(title=title)
-        label = Gtk.Label(selectable=True, wrap=True, xalign=1)
+        label = Gtk.Label(selectable=True, wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, xalign=1)
         label.add_css_class("dim-label")
         row.add_suffix(label)
         row.value = label
@@ -305,8 +375,8 @@ class ConnectionPage(Adw.NavigationPage):
             self.busy.set_title(title)
             self.busy.set_description(GLib.markup_escape_text(description))
         self.stack.set_visible_child_name(name)
-        self.set_can_pop(name not in ("busy", "code"))
-        if name == "password":
+        self.set_can_pop(name not in ("busy", "code", "trust"))
+        if name == "password" and self.password_row.get_visible():
             self.password_row.grab_focus()
         elif name == "code":
             self.code_row.grab_focus()
@@ -315,9 +385,9 @@ class ConnectionPage(Adw.NavigationPage):
         self.conn = conn
         self.set_title(conn["name"])
         self.sign_in.set_title(conn["name"])
-        self.sign_in.set_description(
-            GLib.markup_escape_text(f"{conn.get('username', '')} at {conn.get('gateway', '')}")
-        )
+        self.sign_in.set_description(GLib.markup_escape_text(describe(conn)))
+        # A saved password is sent by cygnet itself.
+        self.password_row.set_visible(not has_saved_password(conn))
 
     def refresh(self):
         """Matches the page to the tunnel's state, unless an attempt is in progress."""
@@ -327,12 +397,13 @@ class ConnectionPage(Adw.NavigationPage):
         w = self.window
         if w.active_id == self.conn["id"]:
             self.address_row.value.set_label(w.address or "—")
-            self.networks_row.value.set_label(self.conn.get("networks", ""))
+            networks = "Set by the gateway" if is_ssl(self.conn) else self.conn.get("networks", "")
+            self.networks_row.value.set_label(networks)
             self.since_row.value.set_label(time.strftime("%H:%M, %d %b", time.localtime(w.since)))
             self.connected_page.set_description(GLib.markup_escape_text(self.conn["name"]))
             self.show("connected")
             return
-        if self.stack.get_visible_child_name() in ("connected", "busy", "code"):
+        if self.stack.get_visible_child_name() in ("connected", "busy", "code", "trust"):
             self.show("password")
         elif self.stack.get_visible_child_name() == "password":
             self.set_can_pop(True)
@@ -346,15 +417,18 @@ class ConnectionPage(Adw.NavigationPage):
     def start(self):
         if self.busy_now or not self.connect_button.get_sensitive():
             return
-        password = self.password_row.get_text()
-        if not password:
-            self.password_row.add_css_class("error")
-            return
+        if self.password_row.get_visible():
+            password = self.password_row.get_text()
+            if not password:
+                self.password_row.add_css_class("error")
+                return
+        else:
+            password = None
         self.password_row.remove_css_class("error")
         self.password_row.set_text("")
         self.password = password
         self.cancelled = self.code_rejected = False
-        self.errors, self.log = [], []
+        self.errors, self.log, self.cert = [], [], {}
         self.session = Session(self.conn["id"], self.on_event, self.on_exit)
         self.show("busy", "Signing In…")
         self.window.refresh()
@@ -375,9 +449,16 @@ class ConnectionPage(Adw.NavigationPage):
         self.session.send(code)
         self.show("busy", "Checking the Code…")
 
+    def trust(self):
+        if self.session:
+            self.window.app.withdraw_notification("code")
+            self.session.send("yes")
+            self.show("busy", "Signing In…")
+
     def on_event(self, event, arg):
-        if event == "need-password" and self.password is not None:
-            self.session.send(self.password)
+        if event == "need-password":
+            # Without one, as when a saved password has gone, cygnet stops and says so.
+            self.session.send(self.password or "")
             self.password = None
         elif event == "connecting":
             self.show("busy", "Signing In…")
@@ -403,6 +484,34 @@ class ConnectionPage(Adw.NavigationPage):
             )
         elif event == "checking":
             self.show("busy", "Checking the Code…")
+        elif event in ("cert-subject", "cert-issuer"):
+            self.cert[event] = arg
+        elif event == "need-trust":
+            digest, _, changed = arg.partition(" ")
+            self.subject_row.value.set_label(self.cert.get("cert-subject") or "—")
+            self.issuer_row.value.set_label(self.cert.get("cert-issuer") or "—")
+            self.digest_row.value.set_label(digest)
+            gateway = f"{self.conn.get('gateway', '')}:{self.conn.get('port', DEFAULT_SSL_PORT)}"
+            if changed:
+                self.trust_page.set_title("The Gateway’s Certificate Changed")
+                description = (
+                    f"{gateway} now shows a different certificate from the one you trusted. That’s "
+                    "expected when it’s renewed, but it could also mean that something is pretending "
+                    "to be the gateway. Check with your VPN admin if you can."
+                )
+            else:
+                self.trust_page.set_title("Trust This Gateway?")
+                description = (
+                    f"This computer can’t verify the certificate of {gateway}. If you trust it, "
+                    "Cygnet remembers it and only asks again if it changes. Check with your VPN "
+                    "admin that this is the gateway’s certificate if you can."
+                )
+            self.trust_page.set_description(GLib.markup_escape_text(description))
+            self.show("trust")
+            self.window.notify_unless_focused(
+                "code", "Check the VPN gateway", f"{self.conn['name']} needs you to trust its certificate.",
+                urgent=True,
+            )
         elif event == "error":
             self.errors.append(arg)
         elif event == "log":
@@ -431,12 +540,13 @@ class ConnectionPage(Adw.NavigationPage):
 
 
 class ConnectionDialog(Adw.Dialog):
-    """Adding or changing a connection."""
+    """Adding or changing a connection. A new one's type, "ipsec" or "ssl", is chosen first."""
 
-    def __init__(self, window, conn=None):
+    def __init__(self, window, conn=None, kind="ipsec"):
         super().__init__(title="Edit Connection" if conn else "Add Connection", content_width=460)
         self.window = window
         self.conn = conn
+        self.kind = "ssl" if (conn and is_ssl(conn)) or (not conn and kind == "ssl") else "ipsec"
         conn = conn or {}
 
         cancel = Gtk.Button(label="Cancel")
@@ -450,7 +560,25 @@ class ConnectionDialog(Adw.Dialog):
 
         page = Adw.PreferencesPage()
         self.rows = {}
-        group = Adw.PreferencesGroup()
+        if self.kind == "ssl":
+            self._ssl_rows(page, conn)
+        else:
+            self._ipsec_rows(page, conn)
+
+        if self.conn:
+            delete = pill("Delete Connection", "destructive-action")
+            delete.connect("clicked", lambda _: self.confirm_delete())
+            group = Adw.PreferencesGroup()
+            group.add(delete)
+            page.add(group)
+
+        view = Adw.ToolbarView(content=page)
+        view.add_top_bar(header)
+        self.set_child(view)
+        self.validate()
+
+    def _ipsec_rows(self, page, conn):
+        group = Adw.PreferencesGroup(title="IPsec (IKEv2)")
         if self.conn:
             group.set_description("Leave the pre-shared key empty to keep the current one.")
         self._entry(group, "name", "Name", conn.get("name", ""), NAME_RE.fullmatch)
@@ -479,17 +607,47 @@ class ConnectionDialog(Adw.Dialog):
         self._entry(expander, "esp_proposals", "ESP Proposals", conn.get("esp_proposals", DEFAULT_ESP), check)
         page.add(group)
 
-        if self.conn:
-            delete = pill("Delete Connection", "destructive-action")
-            delete.connect("clicked", lambda _: self.confirm_delete())
-            group = Adw.PreferencesGroup()
-            group.add(delete)
-            page.add(group)
+    def _ssl_rows(self, page, conn):
+        group = Adw.PreferencesGroup(
+            title="SSL VPN",
+            description="The gateway decides which networks go through the VPN.",
+        )
+        self._entry(group, "name", "Name", conn.get("name", ""), NAME_RE.fullmatch)
+        self._entry(group, "gateway", "Gateway Address", conn.get("gateway", ""), SSL_GATEWAY_RE.fullmatch)
+        self._entry(group, "port", "Port", conn.get("port", DEFAULT_SSL_PORT), valid_port)
+        self._entry(group, "username", "Username", conn.get("username", ""), USERNAME_RE.fullmatch)
+        page.add(group)
 
-        view = Adw.ToolbarView(content=page)
-        view.add_top_bar(header)
-        self.set_child(view)
-        self.validate()
+        saved = bool(self.conn) and has_saved_password(self.conn)
+        group = Adw.PreferencesGroup(
+            title="Password",
+            description="You’re asked for the code each time either way.",
+        )
+        self.save_password = Adw.SwitchRow(
+            title="Save Password",
+            subtitle="Stored on this computer, where only administrators can read it",
+            active=conn.get("save_password") == "yes",
+        )
+        group.add(self.save_password)
+        self._entry(group, "password", "Password", "", lambda v: not v or PASSWORD_RE.fullmatch(v), password=True)
+        self.password_hint = Gtk.Label(
+            label="Leave it empty to keep the saved password." if saved
+            else "Leave it empty to be asked when you connect. It’s saved once the gateway accepts it.",
+            wrap=True, xalign=0, margin_top=6,
+        )
+        self.password_hint.add_css_class("dim-label")
+        self.password_hint.add_css_class("caption")
+        group.add(self.password_hint)
+        page.add(group)
+
+        def toggled(*_):
+            on = self.save_password.get_active()
+            self.rows["password"].set_visible(on)
+            self.password_hint.set_visible(on)
+            self.validate()
+
+        self.save_password.connect("notify::active", toggled)
+        toggled()
 
     def _entry(self, parent, key, title, value, check, password=False):
         row = (Adw.PasswordEntryRow if password else Adw.EntryRow)(title=title, text=value)
@@ -508,7 +666,11 @@ class ConnectionDialog(Adw.Dialog):
     def validate(self):
         ok = True
         for row in self.rows.values():
-            valid = bool(row.check(row.get_text().strip()))
+            if not row.get_visible():
+                continue
+            # Passwords are kept exactly as typed.
+            text = row.get_text() if isinstance(row, Adw.PasswordEntryRow) else row.get_text().strip()
+            valid = bool(row.check(text))
             ok = ok and valid
             if valid or not row.touched:
                 row.remove_css_class("error")
@@ -520,10 +682,15 @@ class ConnectionDialog(Adw.Dialog):
     def save(self):
         if not self.validate():
             return
-        lines = [f"{key}={row.get_text().strip()}" for key, row in self.rows.items() if key != "psk"]
-        psk = self.rows["psk"].get_text()
-        if psk:
-            lines.append(f"psk={psk}")
+        secrets = ("psk", "password")
+        lines = [] if self.conn else [f"type={self.kind}"]
+        lines += [f"{key}={row.get_text().strip()}" for key, row in self.rows.items() if key not in secrets]
+        if self.kind == "ssl":
+            lines.append("save_password=" + ("yes" if self.save_password.get_active() else "no"))
+        for key in secrets:
+            row = self.rows.get(key)
+            if row is not None and row.get_visible() and row.get_text():
+                lines.append(f"{key}={row.get_text()}")
         self.save_button.set_sensitive(False)
         args = ["save", self.conn["id"]] if self.conn else ["save"]
         run_cli(args, "\n".join(lines) + "\n", self.saved)
@@ -537,9 +704,10 @@ class ConnectionDialog(Adw.Dialog):
             self.window.alert("Couldn’t Save the Connection", errors_in(lines), parent=self)
 
     def confirm_delete(self):
+        secret = "saved password" if self.kind == "ssl" else "pre-shared key"
         dialog = Adw.AlertDialog(
             heading=f"Delete {self.conn['name']}?",
-            body="Its settings and pre-shared key are removed from this computer.",
+            body=f"Its settings and {secret} are removed from this computer.",
         )
         dialog.add_response("cancel", "Cancel")
         dialog.add_response("delete", "Delete")
@@ -581,7 +749,7 @@ class Window(Adw.ApplicationWindow):
         empty_add.connect("clicked", lambda _: self.edit())
         empty = status_page(
             "network-vpn-symbolic", "No Connections",
-            "Add your VPN’s gateway address, username and pre-shared key to get started.",
+            "Add your VPN’s gateway address and username to get started.",
         )
         empty.set_child(empty_add)
         self.list_stack.add_named(empty, "empty")
@@ -628,7 +796,7 @@ class Window(Adw.ApplicationWindow):
         self.refresh()
 
     def poll(self):
-        active, address, since = read_tunnel()
+        active, address, since = read_tunnel(self.conns)
         up = active is not None
         if self.was_up and not up and not self.disconnecting and self.connecting_id() is None:
             name = self.conn_name(self.active_id)
@@ -646,7 +814,8 @@ class Window(Adw.ApplicationWindow):
         connecting = self.connecting_id()
         for conn in self.conns:
             row = Adw.ActionRow(title=conn["name"], activatable=True, use_markup=False)
-            row.set_subtitle(f"{conn.get('username', '')} at {conn.get('gateway', '')}")
+            kind = "SSL VPN" if is_ssl(conn) else "IPsec"
+            row.set_subtitle(f"{kind} · {describe(conn)}")
             row.set_subtitle_lines(1)
             # Only network-vpn-symbolic is in every icon theme, so the state is shown with color.
             icon = Gtk.Image(icon_name="network-vpn-symbolic")
@@ -683,7 +852,20 @@ class Window(Adw.ApplicationWindow):
         page.refresh()
 
     def edit(self, conn=None):
-        ConnectionDialog(self, conn).present(self)
+        if conn:
+            ConnectionDialog(self, conn).present(self)
+            return
+        dialog = Adw.AlertDialog(
+            heading="What Kind of VPN?",
+            body="IPsec connections use a pre-shared key and the IKEv2 protocol. SSL VPN "
+            "connections are the ones FortiClient lists under SSL-VPN. Your VPN admin can tell you which.",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("ipsec", "IPsec")
+        dialog.add_response("ssl", "SSL VPN")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", lambda _, r: r != "cancel" and ConnectionDialog(self, kind=r).present(self))
+        dialog.present(self)
 
     def disconnect_vpn(self):
         self.disconnecting = True
@@ -749,7 +931,7 @@ class App(Adw.Application):
             website=WEBSITE,
             issue_url=WEBSITE + "/issues",
             license_type=Gtk.License.GPL_2_0,
-            comments="Connect to FortiGate VPNs that ask for a one-time code.\n\n"
+            comments="Connect to FortiGate IPsec and SSL VPNs that ask for a one-time code.\n\n"
             "An unofficial community tool, not affiliated with Fortinet.",
         ).present(self.window)
 

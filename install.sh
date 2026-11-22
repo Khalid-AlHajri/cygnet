@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Builds a private, patched strongSwan into /opt/cygnet and installs the cygnet command and
-# the Cygnet app, on Ubuntu/Debian or Manjaro/Arch. Run it as your normal user; it uses sudo
+# Builds a private, patched strongSwan into /opt/cygnet for IPsec connections, installs
+# openfortivpn for SSL VPN connections, and installs the cygnet command and the Cygnet app,
+# on Ubuntu/Debian or Manjaro/Arch. Run it as your normal user; it uses sudo
 # where needed.
 #
 #   ./install.sh            install everything
@@ -17,6 +18,7 @@ VERSION=6.1.0
 SHA256=fe6c97481298767213cfc2e9a1da29fdd8018d481ff4cb9cf0283099654f20d4
 PREFIX=/opt/cygnet
 SERVICE=cygnet.service
+SSL_SERVICE=cygnet-ssl.service
 APP_ID=io.github.Khalid_AlHajri.Cygnet
 
 GUI_FILES=(
@@ -43,14 +45,16 @@ HERE=$(dirname "$(readlink -f "$0")")
 
 echo "==> Installing dependencies"
 if command -v pacman >/dev/null; then
-    sudo pacman -S --needed base-devel openssl systemd curl ${gui:+gtk4 libadwaita python-gobject}
+    sudo pacman -S --needed base-devel openssl systemd curl openfortivpn ppp \
+        ${gui:+gtk4 libadwaita python-gobject}
 elif command -v apt-get >/dev/null; then
     sudo apt-get update -qq
     sudo apt-get install -y build-essential pkg-config libssl-dev libsystemd-dev curl bzip2 \
-        ${gui:+python3-gi gir1.2-gtk-4.0 gir1.2-adw-1}
+        openfortivpn ppp ${gui:+python3-gi gir1.2-gtk-4.0 gir1.2-adw-1}
 else
-    echo "Unsupported distro: install a C toolchain and the OpenSSL and systemd headers," >&2
-    echo "plus GTK 4, libadwaita and PyGObject for the app, then remove this check." >&2
+    echo "Unsupported distro: install a C toolchain, the OpenSSL and systemd headers and" >&2
+    echo "openfortivpn, plus GTK 4, libadwaita and PyGObject for the app, then remove this" >&2
+    echo "check." >&2
     exit 1
 fi
 
@@ -82,8 +86,9 @@ sudo make install >"$BUILD/install.log" 2>&1 || { tail -n 30 "$BUILD/install.log
 
 sudo install -m 644 "$HERE/strongswan-fortigate.conf" "$PREFIX/etc/strongswan.d/fortigate.conf"
 sudo install -d -m 755 "$PREFIX/libexec" "$PREFIX/etc/connections"
-sudo install -m 755 "$HERE/otp-helper" "$HERE/dns-hook" "$PREFIX/libexec/"
+sudo install -m 755 "$HERE/otp-helper" "$HERE/dns-hook" "$HERE/ssl-pinentry" "$PREFIX/libexec/"
 sudo install -m 644 "$HERE/$SERVICE" "/etc/systemd/system/$SERVICE"
+sudo install -m 644 "$HERE/$SSL_SERVICE" "/etc/systemd/system/$SSL_SERVICE"
 sudo install -m 755 "$HERE/cygnet" /usr/local/bin/cygnet
 
 if [[ -n $gui ]]; then
